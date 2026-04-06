@@ -45,9 +45,15 @@ Then in `.env`:
 ```
 PADDLEOCR_URL=http://localhost:8868
 PADDLEOCR_TIMEOUT_SECS=120
+PADDLEOCR_MODE=fallback   # or "primary"
 ```
 
-The Rust server will automatically prefer PaddleOCR for scanned documents, falling back to tesseract if the sidecar is unreachable.
+**Routing modes:**
+
+- `fallback` (default) — `pdf_oxide` handles every PDF first; PaddleOCR is called only when the document is scanned or native extraction fails. Tesseract remains the final fallback.
+- `primary` — PaddleOCR PP-StructureV3 runs on every PDF (layout-aware markdown with tables and headings); `pdf_oxide` is used only if the sidecar fails.
+
+Multi-page PDFs are stitched on the sidecar via PP-StructureV3's own `concatenate_markdown_pages` (§2.2 of the official docs), which preserves image references and cross-page tables.
 
 **Smoke test:**
 
@@ -134,6 +140,7 @@ curl http://localhost:8080/billing/plans
 | `JWT_EXPIRY_MINUTES` | optional | default `15` |
 | `PADDLEOCR_URL` | optional | e.g. `http://localhost:8868` |
 | `PADDLEOCR_TIMEOUT_SECS` | optional | default `120` |
+| `PADDLEOCR_MODE` | optional | `fallback` (default) or `primary` — see PaddleOCR section |
 | `ANTHROPIC_API_KEY` | optional | enables Claude Haiku schema extraction |
 | `STRIPE_SECRET_KEY` | optional | enables Stripe billing |
 | `STRIPE_WEBHOOK_SECRET` | optional | required to accept `/billing/webhook` calls |
@@ -184,7 +191,28 @@ See `.env.example` for a full template.
 cargo check
 cargo clippy --all-targets -- -D warnings
 cargo test
+
+# Live sidecar integration tests (env-gated — skipped without PADDLEOCR_URL)
+PADDLEOCR_URL=http://127.0.0.1:8868 cargo test --test test_paddle_ocr_live
+PADDLEOCR_URL=http://127.0.0.1:8868 cargo test --test test_parse_paddle_e2e
 ```
+
+### Test fixtures
+
+All PDFs under `tests/fixtures/` are fully synthetic. Regenerate with:
+
+```bash
+.venv-paddle/bin/python scripts/build_fixtures.py
+```
+
+| Fixture | Covers |
+|---|---|
+| `sample.pdf` | 1-page text invoice (baseline) |
+| `multipage_report.pdf` | 3-page native text (multi-page stitching) |
+| `form_with_labels.pdf` | Labeled fields (label/heading logic) |
+| `table_document.pdf` | Native text with a bordered table |
+| `ordinal_dates.pdf` | Dates with ordinal suffixes (superscript artifact tests) |
+| `scanned_form.pdf` | Image-only PDF (triggers `is_scanned` → OCR path) |
 
 ## License
 
