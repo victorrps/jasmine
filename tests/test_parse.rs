@@ -25,6 +25,7 @@ macro_rules! test_app_with_key {
             pdftoppm_path: "pdftoppm".into(),
             paddleocr_url: None,
             paddleocr_timeout_secs: 120,
+            paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
         };
         let pool = db::init_db(&config.database_url).await.unwrap();
         let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);

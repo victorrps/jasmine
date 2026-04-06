@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # DocForge API Demo Script
 # Usage: ./scripts/demo.sh [PDF_PATH]
-# Default PDF: tests/fixtures/invitation-signed.pdf
+# Default PDF: tests/fixtures/sample.pdf
 
 set -euo pipefail
 
 BASE="http://127.0.0.1:8080"
-PDF="${1:-tests/fixtures/invitation-signed.pdf}"
+PDF="${1:-tests/fixtures/sample.pdf}"
 
 # Colors
 GREEN='\033[0;32m'

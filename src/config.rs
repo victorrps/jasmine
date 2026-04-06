@@ -28,6 +28,29 @@ pub struct AppConfig {
     pub paddleocr_url: Option<String>,
     /// Timeout in seconds for PaddleOCR HTTP calls. Defaults to 120s (layout parsing is slow).
     pub paddleocr_timeout_secs: u64,
+    /// Backend routing mode when PaddleOCR is configured.
+    pub paddleocr_mode: PaddleOcrMode,
+}
+
+/// Backend routing mode for PaddleOCR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddleOcrMode {
+    /// Use pdf_oxide first; fall back to Paddle only for scanned / broken PDFs. (default)
+    Fallback,
+    /// Use Paddle first for every PDF; fall back to pdf_oxide if Paddle fails.
+    Primary,
+}
+
+impl PaddleOcrMode {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "fallback" | "" => Ok(Self::Fallback),
+            "primary" => Ok(Self::Primary),
+            other => anyhow::bail!(
+                "PADDLEOCR_MODE must be 'primary' or 'fallback', got: {other}"
+            ),
+        }
+    }
 }
 
 impl AppConfig {
@@ -87,6 +110,9 @@ impl AppConfig {
             .unwrap_or_else(|| "120".into())
             .parse()
             .context("PADDLEOCR_TIMEOUT_SECS must be a valid u64")?;
+        let paddleocr_mode = PaddleOcrMode::parse(
+            &get("PADDLEOCR_MODE").unwrap_or_else(|| "fallback".into()),
+        )?;
 
         Ok(Self {
             host: get("HOST").unwrap_or_else(|| "127.0.0.1".into()),
@@ -103,6 +129,7 @@ impl AppConfig {
             pdftoppm_path,
             paddleocr_url,
             paddleocr_timeout_secs,
+            paddleocr_mode,
         })
     }
 }
@@ -316,6 +343,39 @@ mod tests {
     }
 
     // ── anthropic_api_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn paddleocr_mode_defaults_to_fallback() {
+        let vars = base_vars();
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Fallback);
+    }
+
+    #[test]
+    fn paddleocr_mode_parses_primary() {
+        let mut vars = base_vars();
+        vars.insert("PADDLEOCR_MODE".into(), "primary".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Primary);
+    }
+
+    #[test]
+    fn paddleocr_mode_parses_primary_case_insensitive() {
+        let mut vars = base_vars();
+        vars.insert("PADDLEOCR_MODE".into(), "PRIMARY".into());
+        assert_eq!(
+            AppConfig::from_vars(&vars).unwrap().paddleocr_mode,
+            PaddleOcrMode::Primary
+        );
+    }
+
+    #[test]
+    fn paddleocr_mode_rejects_invalid_value() {
+        let mut vars = base_vars();
+        vars.insert("PADDLEOCR_MODE".into(), "maybe".into());
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(err.contains("PADDLEOCR_MODE"), "got: {err}");
+    }
 
     #[test]
     fn anthropic_api_key_is_none_when_var_absent() {

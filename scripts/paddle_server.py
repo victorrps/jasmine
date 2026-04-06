@@ -98,20 +98,43 @@ def layout_parsing(req: LayoutRequest) -> JSONResponse:
     try:
         pipeline = get_pipeline()
         log.info("parsing %s (%d bytes)", tmp_path.name, len(raw))
-        results = pipeline.predict(str(tmp_path))
+        results = pipeline.predict(input=str(tmp_path))
 
+        # Per the official docs (§2.2 Python script integration), collect each
+        # page's markdown dict and use the pipeline's own concatenator for the
+        # stitched output — it handles image references and cross-page tables
+        # that naive string-joining would break.
+        markdown_list: list[Any] = []
         pages: list[dict[str, Any]] = []
         for res in results:
-            md_text = _extract_markdown(res)
-            pages.append({"markdown": {"text": md_text}})
+            md_info = getattr(res, "markdown", None)
+            markdown_list.append(md_info)
+            pages.append({"markdown": {"text": _page_markdown_text(md_info, res)}})
 
         if not pages:
             return error(500, "pipeline returned zero pages", status=500)
 
+        combined_md = ""
+        if len(markdown_list) > 0 and hasattr(pipeline, "concatenate_markdown_pages"):
+            try:
+                raw = pipeline.concatenate_markdown_pages(markdown_list)
+                # PP-StructureV3 returns either a str or a dict like
+                # {"markdown_texts": "...", "markdown_images": {...}} — the
+                # Rust client only wants the joined text, so unwrap it.
+                if isinstance(raw, dict):
+                    combined_md = str(raw.get("markdown_texts") or raw.get("text") or "")
+                elif raw is not None:
+                    combined_md = str(raw)
+            except Exception:
+                log.exception("concatenate_markdown_pages failed; falling back to per-page join")
+
         return JSONResponse(
             status_code=200,
             content={
-                "result": {"layoutParsingResults": pages},
+                "result": {
+                    "layoutParsingResults": pages,
+                    "combinedMarkdown": combined_md,
+                },
                 "errorCode": 0,
                 "errorMsg": "",
             },
@@ -124,6 +147,20 @@ def layout_parsing(req: LayoutRequest) -> JSONResponse:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _page_markdown_text(md_info: Any, res: Any) -> str:
+    """Extract a single page's markdown text from a PP-StructureV3 md_info dict/obj."""
+    if md_info is not None:
+        if isinstance(md_info, dict):
+            txt = md_info.get("markdown_texts") or md_info.get("text") or ""
+            if txt:
+                return str(txt)
+        for attr in ("markdown_texts", "text"):
+            val = getattr(md_info, attr, None)
+            if val:
+                return str(val)
+    return _extract_markdown(res)
 
 
 def _extract_markdown(res: Any) -> str:

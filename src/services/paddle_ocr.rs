@@ -66,6 +66,13 @@ struct LayoutResult {
     #[serde(default)]
     #[serde(rename = "layoutParsingResults")]
     layout_parsing_results: Vec<PageResult>,
+    /// Optional pre-concatenated markdown produced by
+    /// `pipeline.concatenate_markdown_pages(...)` on the sidecar (preferred
+    /// over naive per-page joining because it handles image refs and
+    /// cross-page tables).
+    #[serde(default)]
+    #[serde(rename = "combinedMarkdown")]
+    combined_markdown: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,9 +154,9 @@ pub async fn parse_pdf(
         }
     }
 
-    let page_results = parsed
+    let (page_results, combined) = parsed
         .result
-        .map(|r| r.layout_parsing_results)
+        .map(|r| (r.layout_parsing_results, r.combined_markdown))
         .unwrap_or_default();
 
     if page_results.is_empty() {
@@ -158,11 +165,16 @@ pub async fn parse_pdf(
         ));
     }
 
-    build_ocr_result(page_results, start.elapsed().as_millis() as u64)
+    build_ocr_result(
+        page_results,
+        combined,
+        start.elapsed().as_millis() as u64,
+    )
 }
 
 fn build_ocr_result(
     pages: Vec<PageResult>,
+    sidecar_combined: Option<String>,
     processing_ms: u64,
 ) -> Result<OcrResult, AppError> {
     let total_pages = pages.len();
@@ -183,7 +195,31 @@ fn build_ocr_result(
         page_markdowns.push(md);
     }
 
-    let multi_page = total_pages > 1;
+    // Prefer the sidecar's `concatenate_markdown_pages` output (per
+    // PP-StructureV3 §2.2) because it handles image refs and cross-page
+    // tables. Fall back to naive per-page join only when absent/empty.
+    let combined = match sidecar_combined {
+        Some(ref s) if !s.trim().is_empty() => s.trim_end().to_string() + "\n",
+        _ => naive_join(&page_markdowns),
+    };
+
+    let text = ocr_pages
+        .iter()
+        .map(|p| p.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Ok(OcrResult {
+        text,
+        markdown: combined,
+        pages: ocr_pages,
+        processing_ms,
+        warning: None,
+    })
+}
+
+fn naive_join(page_markdowns: &[String]) -> String {
+    let multi_page = page_markdowns.len() > 1;
     let mut combined = String::new();
     for (i, md) in page_markdowns.iter().enumerate() {
         if multi_page {
@@ -197,20 +233,7 @@ fn build_ocr_result(
             combined.push('\n');
         }
     }
-
-    let text = ocr_pages
-        .iter()
-        .map(|p| p.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    Ok(OcrResult {
-        text,
-        markdown: combined.trim_end().to_string() + "\n",
-        pages: ocr_pages,
-        processing_ms,
-        warning: None,
-    })
+    combined.trim_end().to_string() + "\n"
 }
 
 /// Strip markdown syntax to produce a plain-text version of the content.
@@ -318,7 +341,7 @@ mod tests {
         let pages = vec![PageResult {
             markdown: Some(MarkdownField::Text("# Title\n\nBody".into())),
         }];
-        let result = build_ocr_result(pages, 42).unwrap();
+        let result = build_ocr_result(pages, None, 42).unwrap();
         assert!(!result.markdown.contains("## Page 1"));
         assert!(result.markdown.contains("# Title"));
         assert_eq!(result.pages.len(), 1);
@@ -335,7 +358,7 @@ mod tests {
                 markdown: Some(MarkdownField::Text("Second page content".into())),
             },
         ];
-        let result = build_ocr_result(pages, 0).unwrap();
+        let result = build_ocr_result(pages, None, 0).unwrap();
         assert!(result.markdown.contains("## Page 1"));
         assert!(result.markdown.contains("## Page 2"));
         assert!(result.markdown.contains("First page content"));
@@ -348,7 +371,7 @@ mod tests {
         // Empty pages via the public API would hit the empty check earlier,
         // but ensure build_ocr_result handles an empty markdown field gracefully.
         let pages = vec![PageResult { markdown: None }];
-        let result = build_ocr_result(pages, 0).unwrap();
+        let result = build_ocr_result(pages, None, 0).unwrap();
         assert_eq!(result.pages.len(), 1);
     }
 
@@ -386,6 +409,47 @@ mod tests {
         let s = "a".repeat(500);
         let out = truncate(&s, 10);
         assert_eq!(out.chars().count(), 11); // 10 chars + ellipsis
+    }
+
+    #[test]
+    fn build_result_prefers_sidecar_combined_markdown() {
+        let pages = vec![
+            PageResult {
+                markdown: Some(MarkdownField::Text("page one raw".into())),
+            },
+            PageResult {
+                markdown: Some(MarkdownField::Text("page two raw".into())),
+            },
+        ];
+        let combined = Some("# Stitched\n\nProperly joined document.".into());
+        let result = build_ocr_result(pages, combined, 0).unwrap();
+        assert!(result.markdown.contains("# Stitched"));
+        assert!(result.markdown.contains("Properly joined document."));
+        assert!(!result.markdown.contains("## Page 1"));
+    }
+
+    #[test]
+    fn build_result_falls_back_to_naive_when_combined_empty() {
+        let pages = vec![
+            PageResult {
+                markdown: Some(MarkdownField::Text("alpha".into())),
+            },
+            PageResult {
+                markdown: Some(MarkdownField::Text("beta".into())),
+            },
+        ];
+        let result = build_ocr_result(pages, Some("   ".into()), 0).unwrap();
+        assert!(result.markdown.contains("## Page 1"));
+        assert!(result.markdown.contains("## Page 2"));
+    }
+
+    #[test]
+    fn parses_response_with_combined_markdown() {
+        let json = "{\"result\":{\"layoutParsingResults\":[{\"markdown\":{\"text\":\"p1\"}}],\"combinedMarkdown\":\"# Doc\\n\\nBody\"}}";
+        let parsed: LayoutResponse = serde_json::from_str(json).unwrap();
+        let r = parsed.result.unwrap();
+        assert_eq!(r.combined_markdown.as_deref(), Some("# Doc\n\nBody"));
+        assert_eq!(r.layout_parsing_results.len(), 1);
     }
 
     #[test]

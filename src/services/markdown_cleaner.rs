@@ -1097,14 +1097,14 @@ mod tests {
 
     #[test]
     fn demotes_consecutive_h1_short_lines() {
-        let input = "Some text\n\n# Victor\n\n# Rodrigues\n\n# Pintor da\n\n# Silva";
+        let input = "Some text\n\n# Alpha\n\n# Beta\n\n# Gamma da\n\n# Delta";
         let result = fix_headings(input);
         assert!(
-            !result.contains("# Victor"),
+            !result.contains("# Alpha"),
             "consecutive short h1 should be demoted, got: {result}"
         );
-        assert!(result.contains("Victor"));
-        assert!(result.contains("Silva"));
+        assert!(result.contains("Alpha"));
+        assert!(result.contains("Delta"));
     }
 
     #[test]
@@ -1140,7 +1140,7 @@ mod tests {
     #[test]
     fn strips_page_footer() {
         assert!(is_page_footer(
-            "Autodesk, Inc. BI Notice and Consent | Page 2 of 4"
+            "Example Corp Notice and Consent | Page 2 of 4"
         ));
         assert!(is_page_footer("Page 1 of 4"));
     }
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn detects_labeled_fields() {
-        assert!(looks_like_label("Employee Name: Victor"));
+        assert!(looks_like_label("Employee Name: Alice"));
         assert!(looks_like_label("Amount Due: $500.00"));
         assert!(looks_like_label("Bill To: Acme Corp"));
         assert!(looks_like_label("Location: Canada"));
@@ -1174,7 +1174,7 @@ mod tests {
     fn does_not_join_short_lines_without_punctuation() {
         // Short lines like form fields should stay separate
         assert!(!should_join_lines("Bill To: Acme Corp", "Amount Due: $500.00"));
-        assert!(!should_join_lines("Employee Name: Victor", "Department: PSET"));
+        assert!(!should_join_lines("Employee Name: Alice", "Department: Sales"));
     }
 
     #[test]
@@ -1253,16 +1253,6 @@ mod tests {
     }
 
     #[test]
-    fn native_pdf_produces_clean_markdown() {
-        let bytes = include_bytes!("../../tests/fixtures/invitation-signed.pdf");
-        let result = pdf_to_markdown(bytes, "pdftoppm");
-        assert!(result.is_ok(), "should succeed: {result:?}");
-        let md = result.unwrap();
-        assert!(md.contains("Victor"), "got:\n{md}");
-        assert!(!md.contains("<b>"), "no HTML tags");
-    }
-
-    #[test]
     fn sample_invoice_produces_clean_markdown() {
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf");
         let result = pdf_to_markdown(bytes, "pdftoppm");
@@ -1282,8 +1272,8 @@ mod tests {
 
     #[test]
     fn extracts_span_text() {
-        let line = "<span class='ocrx_word' title='bbox 1 2 3 4; x_wconf 95'>AUTODESK</span>";
-        assert_eq!(extract_span_text(line), Some("AUTODESK".into()));
+        let line = "<span class='ocrx_word' title='bbox 1 2 3 4; x_wconf 95'>SAMPLE</span>";
+        assert_eq!(extract_span_text(line), Some("SAMPLE".into()));
     }
 
     #[test]
@@ -1296,10 +1286,10 @@ mod tests {
     #[test]
     fn strips_caption_blocks() {
         let hocr = "<span class='ocr_caption' title='bbox 1 2 3 4'>\n\
-            <span class='ocrx_word' title='bbox 1 2 3 4; x_wconf 95'>AUTODESK</span>\n\
+            <span class='ocrx_word' title='bbox 1 2 3 4; x_wconf 95'>SAMPLE</span>\n\
             </span>";
         let cleaned = preprocess_hocr(hocr);
-        assert!(!cleaned.contains("AUTODESK"), "caption should be stripped");
+        assert!(!cleaned.contains("SAMPLE"), "caption should be stripped");
     }
 
     #[test]

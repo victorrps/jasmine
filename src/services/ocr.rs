@@ -276,19 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn ocr_pdf_with_problematic_pdf() {
+    fn ocr_pdf_with_scanned_form() {
         let config = test_config();
-        let bytes =
-            include_bytes!("../../tests/fixtures/background-check-consent-victor-silva.pdf")
-                .to_vec();
+        let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
         let result = ocr_pdf(&bytes, &config);
-        assert!(
-            result.is_ok(),
-            "problematic PDF OCR must succeed: {result:?}"
-        );
+        assert!(result.is_ok(), "scanned_form.pdf OCR must succeed: {result:?}");
         let ocr = result.unwrap();
         assert!(
-            ocr.text.len() > 100,
+            ocr.text.len() > 20,
             "OCR must extract meaningful text, got {} chars",
             ocr.text.len()
         );

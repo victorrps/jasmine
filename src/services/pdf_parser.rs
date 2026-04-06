@@ -172,12 +172,46 @@ pub async fn parse_pdf_with_backends(
     ocr_config: &ocr::OcrConfig,
     paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
 ) -> Result<ParseResult, AppError> {
+    parse_pdf_with_backends_mode(
+        bytes,
+        ocr_config,
+        paddle_config,
+        crate::config::PaddleOcrMode::Fallback,
+    )
+    .await
+}
+
+/// Same as `parse_pdf_with_backends` but with explicit backend routing mode.
+pub async fn parse_pdf_with_backends_mode(
+    bytes: Vec<u8>,
+    ocr_config: &ocr::OcrConfig,
+    paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
+    mode: crate::config::PaddleOcrMode,
+) -> Result<ParseResult, AppError> {
     let bytes_for_ocr = bytes.clone();
     let ocr_cfg = ocr_config.clone();
     let paddle_cfg = paddle_config.cloned();
     let pdftoppm_path = ocr_config.pdftoppm_path.clone();
 
-    // Try pdf_oxide + pdftohtml first (fast, local, CPU-bound)
+    // Primary mode: try Paddle first for every PDF when configured.
+    if matches!(mode, crate::config::PaddleOcrMode::Primary) {
+        if let Some(cfg) = paddle_cfg.as_ref() {
+            tracing::info!("PaddleOCR mode=primary, trying Paddle before pdf_oxide");
+            match crate::services::paddle_ocr::parse_pdf(&bytes_for_ocr, cfg).await {
+                Ok(result) if !result.markdown.trim().is_empty() => {
+                    return Ok(build_result_from_ocr(result));
+                }
+                Ok(_) => {
+                    tracing::warn!("PaddleOCR returned empty result, falling back to pdf_oxide");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "PaddleOCR failed, falling back to pdf_oxide");
+                }
+            }
+        }
+    }
+
+    // Try pdf_oxide + pdftohtml (fast, local, CPU-bound)
     let local_result = tokio::task::spawn_blocking(move || parse_pdf(bytes, &pdftoppm_path))
         .await
         .map_err(|e| AppError::Internal(format!("Task join error: {e}")))?;
@@ -490,8 +524,8 @@ fn detect_document_type(text: &str) -> Option<String> {
 /// get misplaced by the PDF text extractor. Handles two cases:
 ///
 /// 1. Orphaned line: "nd" on its own line → merge with previous line
-/// 2. Inline merge: "Silvard" (Silva + rd), "32022" (3 + 2022), "andth" (and + th)
-///    → split and reconstruct: "Silva" + newline, "3rd 2022", "and"
+/// 2. Inline merge: "Wordrd" (Word + rd), "32022" (3 + 2022), "andth" (and + th)
+///    → split and reconstruct: "Word" + newline, "3rd 2022", "and"
 fn fix_superscript_artifacts(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let lines: Vec<&str> = text.lines().collect();
@@ -532,7 +566,7 @@ fn fix_superscript_artifacts(text: &str) -> String {
 /// Fix inline superscript artifacts within a single line.
 /// Examples:
 ///   "August 32022" → "August 3rd 2022"  (digit stuck to year)
-///   "Silvard"      → "Silva"            (suffix stuck to word ending)
+///   "Wordrd"       → "Word"             (suffix stuck to word ending)
 ///   "andth"        → "and"              (suffix stuck to word)
 fn fix_inline_superscripts(line: &str) -> String {
     let mut result = line.to_string();
@@ -625,7 +659,7 @@ mod tests {
         );
     }
 
-    // NOTE: Stripping ordinal suffixes from arbitrary English words ("Silvard" → "Silva",
+    // NOTE: Stripping ordinal suffixes from arbitrary English words ("Wordrd" → "Word",
     // "andth" → "and") is not reliable without a full dictionary. These artifacts are
     // best handled by the OCR/VLM pipeline (Day 2) which reads the rendered page image.
     // The inline fix only handles the reliably detectable case: digit+year gluing.
@@ -1065,21 +1099,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_pdf_with_fallback_recovers_problematic_pdf_via_ocr() {
+    async fn parse_pdf_with_fallback_recovers_scanned_pdf_via_ocr() {
         let config = ocr::OcrConfig::default();
-        let bytes =
-            include_bytes!("../../tests/fixtures/background-check-consent-victor-silva.pdf")
-                .to_vec();
+        let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
         let result = parse_pdf_with_backends(bytes, &config, None).await;
         assert!(
             result.is_ok(),
-            "problematic PDF must recover via OCR: {result:?}"
+            "scanned PDF must recover via OCR: {result:?}"
         );
         let parsed = result.unwrap();
-        assert!(parsed.document.metadata.is_scanned);
         assert!(
-            parsed.document.text.len() > 100,
+            parsed.document.metadata.is_scanned,
+            "scanned_form.pdf should be detected as scanned"
+        );
+        assert!(
+            parsed.document.text.len() > 20,
             "OCR must extract meaningful text"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_pdf_handles_multipage_report() {
+        let config = ocr::OcrConfig::default();
+        let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
+        let result = parse_pdf_with_backends(bytes, &config, None).await;
+        assert!(result.is_ok(), "multipage PDF must parse: {result:?}");
+        let parsed = result.unwrap();
+        assert_eq!(parsed.document.metadata.page_count, 3);
+        assert!(parsed.document.text.contains("Section 1"));
+        assert!(parsed.document.text.contains("Section 3"));
     }
 }
