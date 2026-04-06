@@ -59,6 +59,23 @@ pub enum AppError {
 
     #[error("Internal server error")]
     Internal(String),
+
+    /// Request exceeded the configured wall-clock budget. Caller should
+    /// retry with a smaller document or wait. The in-flight blocking work
+    /// continues to completion in the background — the concurrency cap
+    /// (`max_concurrent_parses`) is what prevents stuck tasks from
+    /// compounding under load.
+    #[error("Request deadline exceeded")]
+    DeadlineExceeded,
+
+    /// All concurrency permits are in use. Caller should retry after a
+    /// short backoff (we surface `Retry-After: 5`).
+    #[error("Service is busy, please retry")]
+    ServiceBusy,
+
+    /// PDF is password-protected. We do not attempt to crack or guess.
+    #[error("PDF is encrypted")]
+    EncryptedPdf,
 }
 
 impl AppError {
@@ -79,6 +96,9 @@ impl AppError {
             Self::NotImplemented(_) => "NOT_IMPLEMENTED",
             Self::Database(_) => "INTERNAL_ERROR",
             Self::Internal(_) => "INTERNAL_ERROR",
+            Self::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            Self::ServiceBusy => "SERVICE_BUSY",
+            Self::EncryptedPdf => "ENCRYPTED_PDF",
         }
     }
 
@@ -98,6 +118,9 @@ impl AppError {
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+            Self::ServiceBusy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::EncryptedPdf => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 
@@ -119,7 +142,11 @@ impl AppError {
                 request_id: request_id.into(),
             },
         };
-        HttpResponse::build(self.status()).json(body)
+        let mut builder = HttpResponse::build(self.status());
+        if matches!(self, Self::ServiceBusy) {
+            builder.insert_header(("Retry-After", "5"));
+        }
+        builder.json(body)
     }
 }
 
@@ -210,6 +237,40 @@ mod tests {
     #[test]
     fn internal_maps_to_correct_code() {
         assert_eq!(AppError::Internal("boom".into()).code(), "INTERNAL_ERROR");
+    }
+
+    // ── New variants for Tier 1 hardening ──────────────────────────────
+
+    #[test]
+    fn deadline_exceeded_maps_to_504() {
+        let err = AppError::DeadlineExceeded;
+        assert_eq!(err.code(), "DEADLINE_EXCEEDED");
+        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn service_busy_maps_to_503() {
+        let err = AppError::ServiceBusy;
+        assert_eq!(err.code(), "SERVICE_BUSY");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn encrypted_pdf_maps_to_422() {
+        let err = AppError::EncryptedPdf;
+        assert_eq!(err.code(), "ENCRYPTED_PDF");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn service_busy_response_includes_retry_after_header() {
+        let resp = AppError::ServiceBusy.to_response("req_test");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let h = resp
+            .headers()
+            .get("retry-after")
+            .expect("ServiceBusy must include Retry-After header");
+        assert_eq!(h.to_str().unwrap(), "5");
     }
 
     // ── HTTP status code mapping ──────────────────────────────────────────────

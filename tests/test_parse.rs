@@ -26,6 +26,8 @@ macro_rules! test_app_with_key {
             paddleocr_url: None,
             paddleocr_timeout_secs: 120,
             paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
+            max_concurrent_parses: 8,
+            parse_deadline_secs: 90,
         };
         let pool = db::init_db(&config.database_url).await.unwrap();
         let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
@@ -37,6 +39,9 @@ macro_rules! test_app_with_key {
                 .app_data(web::Data::new(config))
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(Instant::now()))
+                .app_data(web::Data::new(
+                    docforge::services::parse_gate::ParseGate::new(8),
+                ))
                 .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
                 .route("/health", web::get().to(docforge::api::health::health))
                 .service(
@@ -341,6 +346,122 @@ async fn test_parse_unknown_hint_is_ignored() {
         result["document"]["metadata"]["document_type_hint"].is_null(),
         "unknown hint should be dropped, not echoed back"
     );
+}
+
+#[actix_rt::test]
+async fn test_parse_returns_503_when_gate_saturated() {
+    // Custom test app with a gate of capacity 1 so we can saturate it
+    // deterministically. We hold a permit by acquiring on the gate
+    // directly (the gate is shared via web::Data — simulating an
+    // in-flight request without the racy timing of an actual upload).
+    let config = AppConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        database_url: format!(
+            "sqlite://file:test_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        ),
+        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
+        jwt_expiry_minutes: 15,
+        rate_limit_per_minute: 1000,
+        api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
+        anthropic_api_key: None,
+        stripe_secret_key: None,
+        stripe_webhook_secret: None,
+        tesseract_path: "tesseract".into(),
+        pdftoppm_path: "pdftoppm".into(),
+        paddleocr_url: None,
+        paddleocr_timeout_secs: 120,
+        paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
+        max_concurrent_parses: 1,
+        parse_deadline_secs: 90,
+    };
+    let pool = db::init_db(&config.database_url).await.unwrap();
+    let gate = docforge::services::parse_gate::ParseGate::new(1);
+    let gate_for_holding = gate.clone();
+    let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
+
+    let app = test::init_service(
+        App::new()
+            .wrap(docforge::middleware::request_id::RequestIdMiddleware)
+            .wrap(actix_governor::Governor::new(&gov))
+            .app_data(web::Data::new(config))
+            .app_data(web::Data::new(pool))
+            .app_data(web::Data::new(Instant::now()))
+            .app_data(web::Data::new(gate))
+            .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
+            .service(
+                web::scope("/auth")
+                    .route("/register", web::post().to(docforge::auth::handlers::register))
+                    .route("/login", web::post().to(docforge::auth::handlers::login)),
+            )
+            .service(
+                web::scope("/api-keys")
+                    .route("", web::post().to(docforge::auth::handlers::create_key)),
+            )
+            .service(
+                web::scope("/v1")
+                    .route("/parse", web::post().to(docforge::api::parse::parse_pdf)),
+            ),
+    )
+    .await;
+
+    // Register + login + create API key inline (can't reuse the macro
+    // because we need a custom gate). Stripped down: just enough to
+    // authenticate against the saturated handler.
+    let req = test::TestRequest::post()
+        .uri("/auth/register")
+        .set_json(serde_json::json!({
+            "email": "gate@example.com",
+            "password": "test_password_long"
+        }))
+        .to_request();
+    let _ = test::call_service(&app, req).await;
+
+    let req = test::TestRequest::post()
+        .uri("/auth/login")
+        .set_json(serde_json::json!({
+            "email": "gate@example.com",
+            "password": "test_password_long"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let jwt = body["access_token"].as_str().unwrap().to_string();
+
+    let req = test::TestRequest::post()
+        .uri("/api-keys")
+        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .set_json(serde_json::json!({"name":"Test"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let api_key = body["key"].as_str().unwrap().to_string();
+
+    // Hold the only permit. The next /v1/parse must fail-fast with 503.
+    let _held = gate_for_holding
+        .try_acquire()
+        .expect("test setup must hold the gate's only permit");
+
+    let (boundary, payload_body) = build_multipart_pdf(&common::sample_pdf_bytes());
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(payload_body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 503, "saturated gate must short-circuit to 503");
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .expect("503 must include Retry-After header")
+        .to_str()
+        .unwrap();
+    assert_eq!(retry, "5");
 }
 
 #[actix_rt::test]

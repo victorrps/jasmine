@@ -30,6 +30,18 @@ pub struct AppConfig {
     pub paddleocr_timeout_secs: u64,
     /// Backend routing mode when PaddleOCR is configured.
     pub paddleocr_mode: PaddleOcrMode,
+    /// Maximum number of in-flight `/v1/parse` + `/v1/extract` requests this
+    /// instance will accept concurrently. Excess requests are rejected with
+    /// `503 Service Unavailable` and `Retry-After: 5`. Default 8.
+    /// Tune per instance: this is the knob between "queues silently" and
+    /// "fails fast". Combine with horizontal scaling for production load.
+    pub max_concurrent_parses: usize,
+    /// Wall-clock budget for a single `/v1/parse` (or `/v1/extract`) call,
+    /// in seconds. Requests that exceed this return `504 Gateway Timeout`.
+    /// Default 90s. Note: cancelling the future does NOT cancel the
+    /// in-flight `spawn_blocking` work; the concurrency cap above is what
+    /// prevents stuck tasks from compounding.
+    pub parse_deadline_secs: u64,
 }
 
 /// Backend routing mode for PaddleOCR.
@@ -128,6 +140,22 @@ impl AppConfig {
             &get("PADDLEOCR_MODE").unwrap_or_else(|| default_mode.into()),
         )?;
 
+        let max_concurrent_parses: usize = get("MAX_CONCURRENT_PARSES")
+            .unwrap_or_else(|| "8".into())
+            .parse()
+            .context("MAX_CONCURRENT_PARSES must be a valid usize")?;
+        if max_concurrent_parses == 0 {
+            anyhow::bail!("MAX_CONCURRENT_PARSES must be greater than 0");
+        }
+
+        let parse_deadline_secs: u64 = get("PARSE_DEADLINE_SECS")
+            .unwrap_or_else(|| "90".into())
+            .parse()
+            .context("PARSE_DEADLINE_SECS must be a valid u64")?;
+        if parse_deadline_secs == 0 {
+            anyhow::bail!("PARSE_DEADLINE_SECS must be greater than 0");
+        }
+
         Ok(Self {
             host: get("HOST").unwrap_or_else(|| "127.0.0.1".into()),
             port,
@@ -144,6 +172,8 @@ impl AppConfig {
             paddleocr_url,
             paddleocr_timeout_secs,
             paddleocr_mode,
+            max_concurrent_parses,
+            parse_deadline_secs,
         })
     }
 }
@@ -357,6 +387,52 @@ mod tests {
     }
 
     // ── anthropic_api_key ────────────────────────────────────────────────────
+
+    // ── concurrency + deadline ───────────────────────────────────────────────
+
+    #[test]
+    fn max_concurrent_parses_defaults_to_8() {
+        let cfg = AppConfig::from_vars(&base_vars()).unwrap();
+        assert_eq!(cfg.max_concurrent_parses, 8);
+    }
+
+    #[test]
+    fn max_concurrent_parses_parses_custom_value() {
+        let mut vars = base_vars();
+        vars.insert("MAX_CONCURRENT_PARSES".into(), "32".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.max_concurrent_parses, 32);
+    }
+
+    #[test]
+    fn max_concurrent_parses_rejects_zero() {
+        let mut vars = base_vars();
+        vars.insert("MAX_CONCURRENT_PARSES".into(), "0".into());
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(err.contains("MAX_CONCURRENT_PARSES"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_deadline_secs_defaults_to_90() {
+        let cfg = AppConfig::from_vars(&base_vars()).unwrap();
+        assert_eq!(cfg.parse_deadline_secs, 90);
+    }
+
+    #[test]
+    fn parse_deadline_secs_parses_custom_value() {
+        let mut vars = base_vars();
+        vars.insert("PARSE_DEADLINE_SECS".into(), "30".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.parse_deadline_secs, 30);
+    }
+
+    #[test]
+    fn parse_deadline_secs_rejects_zero() {
+        let mut vars = base_vars();
+        vars.insert("PARSE_DEADLINE_SECS".into(), "0".into());
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(err.contains("PARSE_DEADLINE_SECS"), "got: {err}");
+    }
 
     #[test]
     fn paddleocr_mode_defaults_to_fallback_when_url_absent() {

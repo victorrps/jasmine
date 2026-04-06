@@ -190,7 +190,7 @@ pub async fn batch_parse(
             let idx = f.index;
             let name = f.name.clone();
             let bytes = f.bytes;
-            tokio::task::spawn_blocking(move || (idx, name, pdf_parser::parse_pdf(bytes, "pdftoppm")))
+            tokio::task::spawn_blocking(move || (idx, name, pdf_parser::parse_pdf(&bytes, "pdftoppm")))
         })
         .collect();
 
@@ -356,7 +356,7 @@ async fn process_async_batch(
             let idx = f.index;
             let name = f.name.clone();
             let bytes = f.bytes;
-            tokio::task::spawn_blocking(move || (idx, name, pdf_parser::parse_pdf(bytes, "pdftoppm")))
+            tokio::task::spawn_blocking(move || (idx, name, pdf_parser::parse_pdf(&bytes, "pdftoppm")))
         })
         .collect();
 

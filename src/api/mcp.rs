@@ -227,7 +227,7 @@ async fn call_parse_document(
         return JsonRpcResponse::error(id, -32602, "Not a valid PDF file".into());
     }
 
-    match tokio::task::spawn_blocking(move || pdf_parser::parse_pdf(bytes, "pdftoppm")).await {
+    match tokio::task::spawn_blocking(move || pdf_parser::parse_pdf(&bytes, "pdftoppm")).await {
         Ok(Ok(result)) => {
             let text = match serde_json::to_string_pretty(&result) {
                 Ok(t) => t,
@@ -282,7 +282,7 @@ async fn call_extract_fields(
         return JsonRpcResponse::error(id, -32602, "Not a valid PDF file".into());
     }
 
-    let parse_result = match tokio::task::spawn_blocking(move || pdf_parser::parse_pdf(bytes, "pdftoppm")).await
+    let parse_result = match tokio::task::spawn_blocking(move || pdf_parser::parse_pdf(&bytes, "pdftoppm")).await
     {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return JsonRpcResponse::error(id, -32000, format!("Parse failed: {e}")),

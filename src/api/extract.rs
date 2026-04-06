@@ -10,7 +10,10 @@ use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
 use crate::models;
 use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
+use crate::services::parse_gate::ParseGate;
 use crate::services::{ocr, pdf_parser, schema_extractor};
+use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
 const MAX_SCHEMA_SIZE: usize = 64 * 1024; // 64 KB
@@ -26,14 +29,16 @@ pub struct ExtractResponse {
 }
 
 /// POST /v1/extract — upload a PDF + JSON schema, return structured data.
-#[tracing::instrument(skip(auth, payload, pool, config, req_id))]
+#[tracing::instrument(skip(auth, payload, pool, config, gate, req_id))]
 pub async fn extract_pdf(
     auth: ApiKeyAuth,
     mut payload: Multipart,
     pool: web::Data<SqlitePool>,
     config: web::Data<AppConfig>,
+    gate: web::Data<ParseGate>,
     req_id: web::ReqData<RequestId>,
 ) -> Result<HttpResponse, AppError> {
+    let _permit = gate.try_acquire().map_err(|_| AppError::ServiceBusy)?;
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
         return Err(AppError::QuotaExceeded(format!(
@@ -118,6 +123,7 @@ pub async fn extract_pdf(
     if bytes.len() < 64 || &bytes[..5] != PDF_MAGIC {
         return Err(AppError::InvalidPdf);
     }
+    let bytes: pdf_parser::PdfBytes = Arc::<[u8]>::from(bytes);
 
     let schema: serde_json::Value = match schema_str {
         Some(s) => serde_json::from_str(&s)
@@ -141,6 +147,7 @@ pub async fn extract_pdf(
         paddle_config.as_ref(),
         config.paddleocr_mode,
         document_type_hint,
+        Duration::from_secs(config.parse_deadline_secs),
     )
     .await?;
 

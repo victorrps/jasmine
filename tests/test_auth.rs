@@ -26,6 +26,8 @@ macro_rules! test_app {
             paddleocr_url: None,
             paddleocr_timeout_secs: 120,
             paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
+            max_concurrent_parses: 8,
+            parse_deadline_secs: 90,
         };
         let pool = db::init_db(&config.database_url).await.unwrap();
         let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
@@ -36,6 +38,7 @@ macro_rules! test_app {
                 .wrap(actix_governor::Governor::new(&gov))
                 .app_data(web::Data::new(config))
                 .app_data(web::Data::new(pool))
+                .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
                 .app_data(web::Data::new(Instant::now()))
                 .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
                 .route("/health", web::get().to(docforge::api::health::health))

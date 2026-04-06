@@ -10,7 +10,10 @@ use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
 use crate::models;
 use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
+use crate::services::parse_gate::ParseGate;
 use crate::services::{ocr, pdf_parser};
+use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const PDF_MAGIC: &[u8] = b"%PDF-";
@@ -24,14 +27,22 @@ pub struct ParseResponse {
 }
 
 /// POST /v1/parse — upload a PDF and receive structured output.
-#[tracing::instrument(skip(auth, payload, pool, config, req_id))]
+#[tracing::instrument(skip(auth, payload, pool, config, gate, req_id))]
 pub async fn parse_pdf(
     auth: ApiKeyAuth,
     mut payload: Multipart,
     pool: web::Data<SqlitePool>,
     config: web::Data<AppConfig>,
+    gate: web::Data<ParseGate>,
     req_id: web::ReqData<RequestId>,
 ) -> Result<HttpResponse, AppError> {
+    // Acquire a concurrency permit BEFORE the billing check or any
+    // expensive work. The permit is held until the dispatcher returns
+    // (the `_permit` binding lives for the function scope), so even if
+    // the deadline drops the inner future the gate keeps reflecting
+    // real in-flight work.
+    let _permit = gate.try_acquire().map_err(|_| AppError::ServiceBusy)?;
+
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
         return Err(AppError::QuotaExceeded(format!(
@@ -58,6 +69,7 @@ pub async fn parse_pdf(
         paddle_config.as_ref(),
         config.paddleocr_mode,
         document_type_hint,
+        Duration::from_secs(config.parse_deadline_secs),
     )
     .await?;
 
@@ -107,7 +119,7 @@ pub async fn parse_pdf(
 /// wire contract stays narrow and consistent with `/v1/extract`.
 pub async fn extract_parse_upload(
     payload: &mut Multipart,
-) -> Result<(Vec<u8>, Option<DocType>), AppError> {
+) -> Result<(pdf_parser::PdfBytes, Option<DocType>), AppError> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut hint: Option<DocType> = None;
 
@@ -166,5 +178,7 @@ pub async fn extract_parse_upload(
     if bytes.len() < 64 || &bytes[..5] != PDF_MAGIC {
         return Err(AppError::InvalidPdf);
     }
-    Ok((bytes, hint))
+    // Single Vec → Arc materialization at the boundary. Every downstream
+    // consumer takes &PdfBytes / &[u8] and pays only Arc-clone cost.
+    Ok((Arc::<[u8]>::from(bytes), hint))
 }

@@ -304,7 +304,7 @@ mod tests {
     // ── Fixture-driven integration tests ───────────────────────────────────
 
     fn parse(bytes: &[u8]) -> DocumentResult {
-        pdf_parser::parse_pdf(bytes.to_vec(), "pdftoppm")
+        pdf_parser::parse_pdf(bytes, "pdftoppm")
             .expect("fixture must parse")
             .document
     }

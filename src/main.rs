@@ -33,11 +33,13 @@ async fn main() -> anyhow::Result<()> {
     let start_time = Instant::now();
     let governor_cfg = middleware::rate_limit::build_governor(config.rate_limit_per_minute);
     let auth_governor_cfg = middleware::rate_limit::build_auth_governor();
+    let parse_gate = services::parse_gate::ParseGate::new(config.max_concurrent_parses);
 
     let bind_addr = format!("{}:{}", config.host, config.port);
     let config_data = web::Data::new(config);
     let pool_data = web::Data::new(pool);
     let start_data = web::Data::new(start_time);
+    let gate_data = web::Data::new(parse_gate);
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -61,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(config_data.clone())
             .app_data(pool_data.clone())
             .app_data(start_data.clone())
+            .app_data(gate_data.clone())
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             // Health
             .route("/health", web::get().to(api::health::health))

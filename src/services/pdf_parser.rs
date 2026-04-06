@@ -1,9 +1,17 @@
 use serde::Serialize;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::errors::AppError;
 use super::doc_type_detector::{self, DocType, DocumentTypeSource, TypeAlternate};
 use super::ocr;
+
+/// Reference-counted, immutable view of an uploaded PDF. Replaces the
+/// previous `Vec<u8>` parameter so the dispatcher can pass the bytes to
+/// the OCR chain and (if needed) to `parse_pdf` without paying for an
+/// extra copy on every fan-out. The single unavoidable materialization
+/// happens at the `pdf_oxide::PdfDocument::from_bytes` boundary.
+pub type PdfBytes = Arc<[u8]>;
 
 /// Result of parsing a single PDF document.
 #[derive(Debug, Serialize)]
@@ -98,10 +106,23 @@ pub struct UsageInfo {
 /// Parse a PDF from raw bytes. This is CPU-bound — call via spawn_blocking.
 ///
 /// Uses pdf_oxide for raw text extraction and pdftohtml for structured markdown.
-pub fn parse_pdf(bytes: Vec<u8>, pdftoppm_path: &str) -> Result<ParseResult, AppError> {
+/// Takes a borrowed slice so the dispatcher can pass `&PdfBytes` (an
+/// `Arc<[u8]>` deref) without paying for an extra copy. The single
+/// unavoidable `Vec` materialization happens inside this function at the
+/// `pdf_oxide::PdfDocument::from_bytes` boundary.
+pub fn parse_pdf(bytes: &[u8], pdftoppm_path: &str) -> Result<ParseResult, AppError> {
     let start = Instant::now();
 
-    let mut doc = pdf_oxide::PdfDocument::from_bytes(bytes.clone())
+    // Refuse password-protected PDFs up front. We do not crack, guess, or
+    // attempt OCR on encrypted documents — that would be a customer
+    // surprise (silently bypassing access control on a doc the caller
+    // may not be authorized to read in cleartext). Maps to 422 with
+    // `code: ENCRYPTED_PDF`.
+    if is_encrypted_pdf(bytes) {
+        return Err(AppError::EncryptedPdf);
+    }
+
+    let mut doc = pdf_oxide::PdfDocument::from_bytes(bytes.to_vec())
         .map_err(|e| AppError::PdfProcessing(format!("Failed to open PDF: {e}")))?;
 
     let page_count = doc
@@ -142,7 +163,7 @@ pub fn parse_pdf(bytes: Vec<u8>, pdftoppm_path: &str) -> Result<ParseResult, App
     let is_scanned = avg_chars < 50.0;
 
     // Generate structured markdown via pdftohtml (preserves fonts/headings)
-    let markdown = match super::markdown_cleaner::pdf_to_markdown(&bytes, pdftoppm_path) {
+    let markdown = match super::markdown_cleaner::pdf_to_markdown(bytes, pdftoppm_path) {
         Ok(md) if !md.trim().is_empty() => md,
         Ok(_) | Err(_) => {
             // Fallback: basic markdown from raw text
@@ -269,6 +290,26 @@ fn apply_document_type_hint(result: &mut ParseResult, hint: Option<DocType>) {
     result.document.metadata.document_type_source = source;
 }
 
+/// Cheap byte-scan for the `/Encrypt` trailer entry that marks a
+/// password-protected PDF.
+///
+/// We look at the first ~4 KB of the file. The trailer dict is at the
+/// end of the file in the spec, but most encrypted PDFs land the
+/// `/Encrypt` reference much earlier (cross-reference stream, document
+/// catalog, or near the header in linearized PDFs). For files we
+/// cannot scan in 4 KB we err on the side of "not encrypted" and let
+/// pdf_oxide surface the parse error — we'd rather miss an exotic
+/// encryption layout than block a legitimate doc.
+///
+/// The leading `/` anchors the keyword so prose containing the word
+/// "Encrypted" doesn't trip the check.
+fn is_encrypted_pdf(bytes: &[u8]) -> bool {
+    const SCAN_WINDOW: usize = 4 * 1024;
+    let needle = b"/Encrypt";
+    let window = &bytes[..bytes.len().min(SCAN_WINDOW)];
+    window.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Returns true if the error is a structural PDF parsing failure that OCR can recover from.
 /// These are cases where pdf_oxide can't read the PDF structure, but the file is still a
 /// valid PDF that Claude Vision can process visually.
@@ -306,20 +347,38 @@ fn finalize_ocr_result(
 }
 
 /// Parse a PDF and dispatch to the right backend based on routing mode.
+///
+/// The `deadline` is a wall-clock budget for the whole call. On expiry the
+/// future is dropped and the caller receives [`AppError::DeadlineExceeded`]
+/// (`504 Gateway Timeout`). Note: dropping the future does NOT cancel any
+/// `spawn_blocking` work it dispatched — that work runs to completion in
+/// the background. Pair this with the `ParseGate` semaphore in the
+/// handlers so abandoned-but-still-running tasks cannot compound.
 pub async fn parse_pdf_with_backends_mode(
-    bytes: Vec<u8>,
+    bytes: PdfBytes,
     ocr_config: &ocr::OcrConfig,
     paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
     mode: crate::config::PaddleOcrMode,
     document_type_hint: Option<DocType>,
+    deadline: Duration,
 ) -> Result<ParseResult, AppError> {
-    let mut result = dispatch_inner(bytes, ocr_config, paddle_config, mode).await?;
+    let inner = dispatch_inner(bytes, ocr_config, paddle_config, mode);
+    let mut result = match tokio::time::timeout(deadline, inner).await {
+        Ok(res) => res?,
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_secs = deadline.as_secs(),
+                "parse deadline exceeded"
+            );
+            return Err(AppError::DeadlineExceeded);
+        }
+    };
     apply_document_type_hint(&mut result, document_type_hint);
     Ok(result)
 }
 
 async fn dispatch_inner(
-    bytes: Vec<u8>,
+    bytes: PdfBytes,
     ocr_config: &ocr::OcrConfig,
     paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
     mode: crate::config::PaddleOcrMode,
@@ -327,7 +386,7 @@ async fn dispatch_inner(
     use crate::config::PaddleOcrMode;
     use super::pdf_classifier::PdfClass;
 
-    let bytes_for_ocr = bytes.clone();
+    let bytes_for_ocr: PdfBytes = Arc::clone(&bytes);
     let ocr_cfg = ocr_config.clone();
     let paddle_cfg = paddle_config.cloned();
     let pdftoppm_path = ocr_config.pdftoppm_path.clone();
@@ -350,10 +409,15 @@ async fn dispatch_inner(
         }
     }
 
-    // Try pdf_oxide + pdftohtml (fast, local, CPU-bound)
-    let local_result = tokio::task::spawn_blocking(move || parse_pdf(bytes, &pdftoppm_path))
-        .await
-        .map_err(|e| AppError::Internal(format!("Task join error: {e}")))?;
+    // Try pdf_oxide + pdftohtml (fast, local, CPU-bound). The Arc clone is
+    // O(1) and lets `parse_pdf` borrow without forcing the dispatcher to
+    // own a `Vec<u8>`.
+    let bytes_for_local: PdfBytes = Arc::clone(&bytes);
+    let local_result = tokio::task::spawn_blocking(move || {
+        parse_pdf(&bytes_for_local, &pdftoppm_path)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task join error: {e}")))?;
 
     match local_result {
         Ok(mut result) => {
@@ -473,7 +537,7 @@ async fn dispatch_inner(
 /// can tag `routed_to` accurately even when Paddle fails and Tesseract
 /// recovers.
 async fn run_ocr_backends(
-    bytes: &[u8],
+    bytes: &PdfBytes,
     tesseract_cfg: &ocr::OcrConfig,
     paddle_cfg: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
 ) -> Option<OcrBackendOutcome> {
@@ -501,10 +565,11 @@ async fn run_ocr_backends(
         }
     }
 
-    // Fall back to tesseract
-    let bytes_owned = bytes.to_vec();
+    // Fall back to tesseract. The Arc clone is cheap; ocr_pdf borrows
+    // through the deref so no Vec materialization is needed.
+    let bytes_for_tess: PdfBytes = Arc::clone(bytes);
     let cfg = tesseract_cfg.clone();
-    match tokio::task::spawn_blocking(move || ocr::ocr_pdf(&bytes_owned, &cfg)).await {
+    match tokio::task::spawn_blocking(move || ocr::ocr_pdf(&bytes_for_tess, &cfg)).await {
         Ok(Ok(result)) if !result.text.is_empty() => Some(OcrBackendOutcome {
             result,
             backend: RoutedTo::Tesseract,
@@ -949,28 +1014,28 @@ mod tests {
 
     #[test]
     fn test_parse_pdf_rejects_empty_bytes() {
-        let result = parse_pdf(vec![], "pdftoppm");
+        let result = parse_pdf(&[], "pdftoppm");
         assert!(result.is_err(), "empty bytes must return an error");
     }
 
     #[test]
     fn test_parse_pdf_rejects_non_pdf_bytes() {
         let garbage = b"this is not a pdf file at all!!!!".to_vec();
-        let result = parse_pdf(garbage, "pdftoppm");
+        let result = parse_pdf(&garbage, "pdftoppm");
         assert!(result.is_err(), "non-PDF bytes must return an error");
     }
 
     #[test]
     fn test_parse_pdf_rejects_truncated_pdf_header() {
         let partial = b"%PDF-1.4".to_vec();
-        let result = parse_pdf(partial, "pdftoppm");
+        let result = parse_pdf(&partial, "pdftoppm");
         assert!(result.is_err(), "truncated PDF must return an error");
     }
 
     #[test]
     fn test_parse_pdf_valid_sample() {
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        let result = parse_pdf(bytes, "pdftoppm");
+        let result = parse_pdf(&bytes, "pdftoppm");
         assert!(
             result.is_ok(),
             "sample.pdf must parse successfully: {result:?}"
@@ -988,7 +1053,7 @@ mod tests {
     #[test]
     fn test_usage_credits_are_two_per_page() {
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        if let Ok(result) = parse_pdf(bytes, "pdftoppm") {
+        if let Ok(result) = parse_pdf(&bytes, "pdftoppm") {
             assert_eq!(result.usage.credits_used, result.usage.pages_processed * 2);
         }
     }
@@ -1146,7 +1211,7 @@ mod tests {
     async fn parse_pdf_with_fallback_succeeds_for_valid_pdf() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback, None).await;
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes), &config, None, crate::config::PaddleOcrMode::Fallback, None, std::time::Duration::from_secs(90)).await;
         assert!(result.is_ok(), "valid PDF must parse: {result:?}");
         let parsed = result.unwrap();
         assert!(parsed.document.metadata.page_count > 0);
@@ -1156,12 +1221,12 @@ mod tests {
     async fn parse_pdf_with_fallback_returns_error_for_garbage() {
         let config = ocr::OcrConfig::default();
         let garbage = b"this is not a PDF at all and never will be ever".to_vec();
-        let result = parse_pdf_with_backends_mode(
-            garbage,
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(garbage),
             &config,
             None,
             crate::config::PaddleOcrMode::Fallback,
             None,
+            std::time::Duration::from_secs(90),
         )
         .await;
         assert!(result.is_err());
@@ -1173,12 +1238,12 @@ mod tests {
     async fn auto_mode_routes_text_simple_to_pdf_oxide() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(
-            bytes,
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes),
             &config,
             None,
             crate::config::PaddleOcrMode::Auto,
             None,
+            std::time::Duration::from_secs(90),
         )
         .await
         .unwrap();
@@ -1200,12 +1265,12 @@ mod tests {
         // paddle_cfg the Auto path must gracefully degrade to pdf_oxide.
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/table_document.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(
-            bytes,
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes),
             &config,
             None,
             crate::config::PaddleOcrMode::Auto,
             None,
+            std::time::Duration::from_secs(90),
         )
         .await
         .unwrap();
@@ -1223,12 +1288,12 @@ mod tests {
         // land on Tesseract via the OCR chain and tag routed_to accurately.
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(
-            bytes,
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes),
             &config,
             None,
             crate::config::PaddleOcrMode::Auto,
             None,
+            std::time::Duration::from_secs(90),
         )
         .await
         .unwrap();
@@ -1253,12 +1318,12 @@ mod tests {
         // Sanity: non-Auto modes also set routed_to for observability.
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(
-            bytes,
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes),
             &config,
             None,
             crate::config::PaddleOcrMode::Fallback,
             None,
+            std::time::Duration::from_secs(90),
         )
         .await
         .unwrap();
@@ -1273,7 +1338,7 @@ mod tests {
     async fn parse_pdf_with_fallback_recovers_scanned_pdf_via_ocr() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback, None).await;
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes), &config, None, crate::config::PaddleOcrMode::Fallback, None, std::time::Duration::from_secs(90)).await;
         assert!(
             result.is_ok(),
             "scanned PDF must recover via OCR: {result:?}"
@@ -1293,7 +1358,7 @@ mod tests {
     async fn parse_pdf_handles_multipage_report() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback, None).await;
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes), &config, None, crate::config::PaddleOcrMode::Fallback, None, std::time::Duration::from_secs(90)).await;
         assert!(result.is_ok(), "multipage PDF must parse: {result:?}");
         let parsed = result.unwrap();
         assert_eq!(parsed.document.metadata.page_count, 3);
@@ -1310,14 +1375,14 @@ mod tests {
     #[test]
     fn fixture_oracle_sample_invoice() {
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        let r = parse_pdf(&bytes, "pdftoppm").unwrap();
         assert_eq!(r.document.metadata.detected_type, Some(DocType::Invoice));
     }
 
     #[test]
     fn fixture_oracle_multipage_report_is_report_or_none() {
         let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
-        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        let r = parse_pdf(&bytes, "pdftoppm").unwrap();
         // Report or None are both acceptable outcomes — the important
         // thing is that the old "stringly-typed" noise is gone.
         match r.document.metadata.detected_type {
@@ -1329,7 +1394,7 @@ mod tests {
     #[test]
     fn fixture_oracle_long_article_is_article_or_none() {
         let bytes = include_bytes!("../../tests/fixtures/long_article.pdf").to_vec();
-        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        let r = parse_pdf(&bytes, "pdftoppm").unwrap();
         match r.document.metadata.detected_type {
             Some(DocType::Article) | None => {}
             other => panic!("unexpected detected_type: {other:?}"),
@@ -1339,7 +1404,7 @@ mod tests {
     #[test]
     fn fixture_oracle_form_with_labels_is_form_or_none() {
         let bytes = include_bytes!("../../tests/fixtures/form_with_labels.pdf").to_vec();
-        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        let r = parse_pdf(&bytes, "pdftoppm").unwrap();
         match r.document.metadata.detected_type {
             Some(DocType::Form) | None => {}
             other => panic!("unexpected detected_type: {other:?}"),
@@ -1378,16 +1443,83 @@ mod tests {
         assert_eq!(source, None);
     }
 
+    // ── Encrypted-PDF detection ─────────────────────────────────────────
+
+    #[test]
+    fn is_encrypted_pdf_detects_encrypt_trailer_entry() {
+        // Minimal synthetic PDF prefix containing an /Encrypt trailer
+        // entry. We do not care that this is a complete or parseable PDF
+        // — the detector only needs to find the keyword in the first
+        // 4 KB after the header.
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend_from_slice(b"%some binary marker\n");
+        bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R /Encrypt 4 0 R >>\n");
+        bytes.resize(256, b' ');
+        assert!(is_encrypted_pdf(&bytes));
+    }
+
+    #[test]
+    fn is_encrypted_pdf_false_for_plain_sample() {
+        let bytes = include_bytes!("../../tests/fixtures/sample.pdf");
+        assert!(!is_encrypted_pdf(bytes));
+    }
+
+    #[test]
+    fn is_encrypted_pdf_does_not_false_positive_on_substring() {
+        // The literal "Encrypt" inside content text (not as a trailer
+        // dict key) does not constitute an encrypted PDF. We require
+        // the leading "/" to anchor the keyword.
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend_from_slice(b"This document discusses Encrypted communications.\n");
+        bytes.resize(256, b' ');
+        assert!(!is_encrypted_pdf(&bytes));
+    }
+
+    #[test]
+    fn parse_pdf_returns_encrypted_pdf_error_on_encrypt_trailer() {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R /Encrypt 4 0 R >>\n");
+        bytes.resize(256, b' ');
+        let err = parse_pdf(&bytes, "pdftoppm").unwrap_err();
+        assert!(
+            matches!(err, AppError::EncryptedPdf),
+            "expected EncryptedPdf, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_returns_deadline_exceeded_when_budget_is_zero() {
+        // A 1ns deadline cannot accommodate any real backend work, so the
+        // dispatcher must surface DeadlineExceeded regardless of which
+        // mode is in use. We deliberately use a valid PDF here so the
+        // failure can only come from the timeout, not from a parse error.
+        let config = ocr::OcrConfig::default();
+        let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
+        let result = parse_pdf_with_backends_mode(
+            std::sync::Arc::<[u8]>::from(bytes),
+            &config,
+            None,
+            crate::config::PaddleOcrMode::Fallback,
+            None,
+            std::time::Duration::from_nanos(1),
+        )
+        .await;
+        match result {
+            Err(AppError::DeadlineExceeded) => {}
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn dispatcher_threads_document_type_hint_into_metadata() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(
-            bytes,
+        let result = parse_pdf_with_backends_mode(std::sync::Arc::<[u8]>::from(bytes),
             &config,
             None,
             crate::config::PaddleOcrMode::Fallback,
             Some(DocType::Quote),
+            std::time::Duration::from_secs(90),
         )
         .await
         .unwrap();
