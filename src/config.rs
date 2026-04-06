@@ -35,19 +35,24 @@ pub struct AppConfig {
 /// Backend routing mode for PaddleOCR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaddleOcrMode {
-    /// Use pdf_oxide first; fall back to Paddle only for scanned / broken PDFs. (default)
+    /// Use pdf_oxide first; fall back to Paddle only for scanned / broken PDFs.
     Fallback,
     /// Use Paddle first for every PDF; fall back to pdf_oxide if Paddle fails.
     Primary,
+    /// Classify the document (via `pdf_classifier`) and pick a backend per
+    /// document: plain text → pdf_oxide, structured → Paddle, scanned → OCR.
+    /// This is the default when `PADDLEOCR_URL` is configured.
+    Auto,
 }
 
 impl PaddleOcrMode {
     fn parse(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "fallback" | "" => Ok(Self::Fallback),
+            "fallback" => Ok(Self::Fallback),
             "primary" => Ok(Self::Primary),
+            "auto" => Ok(Self::Auto),
             other => anyhow::bail!(
-                "PADDLEOCR_MODE must be 'primary' or 'fallback', got: {other}"
+                "PADDLEOCR_MODE must be 'auto', 'primary', or 'fallback', got: {other}"
             ),
         }
     }
@@ -110,8 +115,17 @@ impl AppConfig {
             .unwrap_or_else(|| "120".into())
             .parse()
             .context("PADDLEOCR_TIMEOUT_SECS must be a valid u64")?;
+        // Default: `auto` when a sidecar URL is configured, `fallback` otherwise.
+        // This keeps existing deployments without a sidecar unchanged while
+        // making classifier-based routing the out-of-the-box behaviour for
+        // anyone who opts in to running PaddleOCR.
+        let default_mode = if paddleocr_url.is_some() {
+            "auto"
+        } else {
+            "fallback"
+        };
         let paddleocr_mode = PaddleOcrMode::parse(
-            &get("PADDLEOCR_MODE").unwrap_or_else(|| "fallback".into()),
+            &get("PADDLEOCR_MODE").unwrap_or_else(|| default_mode.into()),
         )?;
 
         Ok(Self {
@@ -345,10 +359,18 @@ mod tests {
     // ── anthropic_api_key ────────────────────────────────────────────────────
 
     #[test]
-    fn paddleocr_mode_defaults_to_fallback() {
+    fn paddleocr_mode_defaults_to_fallback_when_url_absent() {
         let vars = base_vars();
         let cfg = AppConfig::from_vars(&vars).unwrap();
         assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Fallback);
+    }
+
+    #[test]
+    fn paddleocr_mode_defaults_to_auto_when_url_set() {
+        let mut vars = base_vars();
+        vars.insert("PADDLEOCR_URL".into(), "http://localhost:8868".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Auto);
     }
 
     #[test]
@@ -357,6 +379,24 @@ mod tests {
         vars.insert("PADDLEOCR_MODE".into(), "primary".into());
         let cfg = AppConfig::from_vars(&vars).unwrap();
         assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Primary);
+    }
+
+    #[test]
+    fn paddleocr_mode_parses_auto_explicit_even_without_url() {
+        let mut vars = base_vars();
+        vars.insert("PADDLEOCR_MODE".into(), "auto".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Auto);
+    }
+
+    #[test]
+    fn paddleocr_mode_parses_fallback_explicit_with_url() {
+        // Explicit override beats the URL-driven default.
+        let mut vars = base_vars();
+        vars.insert("PADDLEOCR_URL".into(), "http://localhost:8868".into());
+        vars.insert("PADDLEOCR_MODE".into(), "fallback".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.paddleocr_mode, PaddleOcrMode::Fallback);
     }
 
     #[test]

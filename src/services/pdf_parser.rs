@@ -47,6 +47,14 @@ pub struct DocumentMetadata {
     pub detected_type: Option<String>,
     pub image_count: u32,
     pub processing_ms: u64,
+    /// Classifier output (only set when `PaddleOcrMode::Auto` routing ran).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<super::pdf_classifier::ClassificationReport>,
+    /// Which backend actually produced this result. One of `pdf_oxide`,
+    /// `paddle`, `tesseract`. Only set when the dispatcher picked a backend
+    /// (i.e. from `parse_pdf_with_backends_mode`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_to: Option<&'static str>,
 }
 
 /// Credits and pages processed.
@@ -134,6 +142,8 @@ pub fn parse_pdf(bytes: Vec<u8>, pdftoppm_path: &str) -> Result<ParseResult, App
                 detected_type,
                 image_count: 0,
                 processing_ms,
+                classification: None,
+                routed_to: None,
             },
         },
         usage: UsageInfo {
@@ -158,48 +168,28 @@ fn is_ocr_recoverable(err: &AppError) -> bool {
     }
 }
 
-/// Parse a PDF with a preferred structured-OCR backend (PaddleOCR PP-StructureV3).
-///
-/// Strategy:
-/// 1. Try pdf_oxide + pdftohtml (fastest, native text extraction).
-/// 2. If that fails structurally OR the document is scanned, try PaddleOCR if configured
-///    (layout-aware, table recognition, heading hierarchy, native Markdown).
-/// 3. If PaddleOCR is not configured or fails, fall back to local tesseract.
-///
-/// All processing is local — no customer data leaves the server.
-pub async fn parse_pdf_with_backends(
-    bytes: Vec<u8>,
-    ocr_config: &ocr::OcrConfig,
-    paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
-) -> Result<ParseResult, AppError> {
-    parse_pdf_with_backends_mode(
-        bytes,
-        ocr_config,
-        paddle_config,
-        crate::config::PaddleOcrMode::Fallback,
-    )
-    .await
-}
-
-/// Same as `parse_pdf_with_backends` but with explicit backend routing mode.
+/// Parse a PDF and dispatch to the right backend based on routing mode.
 pub async fn parse_pdf_with_backends_mode(
     bytes: Vec<u8>,
     ocr_config: &ocr::OcrConfig,
     paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
     mode: crate::config::PaddleOcrMode,
 ) -> Result<ParseResult, AppError> {
+    use crate::config::PaddleOcrMode;
     let bytes_for_ocr = bytes.clone();
     let ocr_cfg = ocr_config.clone();
     let paddle_cfg = paddle_config.cloned();
     let pdftoppm_path = ocr_config.pdftoppm_path.clone();
 
     // Primary mode: try Paddle first for every PDF when configured.
-    if matches!(mode, crate::config::PaddleOcrMode::Primary) {
+    if matches!(mode, PaddleOcrMode::Primary) {
         if let Some(cfg) = paddle_cfg.as_ref() {
             tracing::info!("PaddleOCR mode=primary, trying Paddle before pdf_oxide");
             match crate::services::paddle_ocr::parse_pdf(&bytes_for_ocr, cfg).await {
                 Ok(result) if !result.markdown.trim().is_empty() => {
-                    return Ok(build_result_from_ocr(result));
+                    let mut pr = build_result_from_ocr(result);
+                    pr.document.metadata.routed_to = Some("paddle");
+                    return Ok(pr);
                 }
                 Ok(_) => {
                     tracing::warn!("PaddleOCR returned empty result, falling back to pdf_oxide");
@@ -218,21 +208,106 @@ pub async fn parse_pdf_with_backends_mode(
 
     match local_result {
         Ok(mut result) => {
-            // If pdf_oxide "succeeded" but detected a scanned doc, try OCR backends
+            // Auto mode: classify the first-pass result and route from there.
+            if matches!(mode, PaddleOcrMode::Auto) {
+                let report = super::pdf_classifier::classify(&result.document);
+                result.document.metadata.classification = Some(report);
+
+                use super::pdf_classifier::PdfClass;
+                match report.class {
+                    PdfClass::TextSimple => {
+                        result.document.metadata.routed_to = Some("pdf_oxide");
+                        return Ok(result);
+                    }
+                    PdfClass::TextStructured => {
+                        if let Some(cfg) = paddle_cfg.as_ref() {
+                            tracing::info!(
+                                "PaddleOCR mode=auto, class=text_structured → Paddle"
+                            );
+                            match crate::services::paddle_ocr::parse_pdf(&bytes_for_ocr, cfg).await
+                            {
+                                Ok(pr) if !pr.markdown.trim().is_empty() => {
+                                    let mut out = build_result_from_ocr(pr);
+                                    out.document.metadata.classification = Some(report);
+                                    out.document.metadata.routed_to = Some("paddle");
+                                    return Ok(out);
+                                }
+                                Ok(_) => tracing::warn!(
+                                    "PaddleOCR empty on structured doc, keeping pdf_oxide"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "PaddleOCR failed on structured doc, keeping pdf_oxide"
+                                ),
+                            }
+                        }
+                        result.document.metadata.routed_to = Some("pdf_oxide");
+                        return Ok(result);
+                    }
+                    PdfClass::ScannedOrEmpty => {
+                        tracing::info!("PaddleOCR mode=auto, class=scanned → OCR chain");
+                        if let Some(ocr_result) =
+                            run_ocr_backends(&bytes_for_ocr, &ocr_cfg, paddle_cfg.as_ref()).await
+                        {
+                            let backend_tag = if paddle_cfg.is_some() {
+                                "paddle"
+                            } else {
+                                "tesseract"
+                            };
+                            let mut out = build_result_from_ocr(ocr_result);
+                            out.document.metadata.classification = Some(report);
+                            out.document.metadata.routed_to = Some(backend_tag);
+                            return Ok(out);
+                        }
+                        // All OCR backends failed — fall through to the
+                        // pdf_oxide result even though it's scanned. The
+                        // caller will see empty text but at least gets a
+                        // shaped response.
+                        result.document.metadata.routed_to = Some("pdf_oxide");
+                        return Ok(result);
+                    }
+                    PdfClass::Unknown => {
+                        // Safe default: behave like Fallback mode below.
+                        tracing::info!("PaddleOCR mode=auto, class=unknown → fallback behaviour");
+                        // fall through
+                    }
+                }
+            }
+
+            // Fallback mode (or Auto/Unknown): pdf_oxide first, OCR only if scanned.
             if result.document.metadata.is_scanned {
                 tracing::info!("Scanned PDF detected, attempting structured OCR");
                 if let Some(ocr_result) =
                     run_ocr_backends(&bytes_for_ocr, &ocr_cfg, paddle_cfg.as_ref()).await
                 {
+                    let backend_tag = if paddle_cfg.is_some() {
+                        "paddle"
+                    } else {
+                        "tesseract"
+                    };
+                    let cls = result.document.metadata.classification;
                     result = build_result_from_ocr(ocr_result);
+                    result.document.metadata.classification = cls;
+                    result.document.metadata.routed_to = Some(backend_tag);
+                    return Ok(result);
                 }
             }
+            result.document.metadata.routed_to = Some("pdf_oxide");
             Ok(result)
         }
         Err(err) if is_ocr_recoverable(&err) => {
             tracing::warn!(error = %err, "pdf_oxide failed, attempting structured OCR");
             match run_ocr_backends(&bytes_for_ocr, &ocr_cfg, paddle_cfg.as_ref()).await {
-                Some(ocr_result) => Ok(build_result_from_ocr(ocr_result)),
+                Some(ocr_result) => {
+                    let backend_tag = if paddle_cfg.is_some() {
+                        "paddle"
+                    } else {
+                        "tesseract"
+                    };
+                    let mut out = build_result_from_ocr(ocr_result);
+                    out.document.metadata.routed_to = Some(backend_tag);
+                    Ok(out)
+                }
                 None => Err(AppError::PdfProcessing(
                     "All OCR backends failed to parse the document".into(),
                 )),
@@ -331,6 +406,8 @@ fn build_result_from_ocr(ocr_result: ocr::OcrResult) -> ParseResult {
                 detected_type,
                 image_count: 0,
                 processing_ms: ocr_result.processing_ms,
+                classification: None,
+                routed_to: None,
             },
         },
         usage: UsageInfo {
@@ -1084,7 +1161,7 @@ mod tests {
     async fn parse_pdf_with_fallback_succeeds_for_valid_pdf() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        let result = parse_pdf_with_backends(bytes, &config, None).await;
+        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback).await;
         assert!(result.is_ok(), "valid PDF must parse: {result:?}");
         let parsed = result.unwrap();
         assert!(parsed.document.metadata.page_count > 0);
@@ -1094,15 +1171,89 @@ mod tests {
     async fn parse_pdf_with_fallback_returns_error_for_garbage() {
         let config = ocr::OcrConfig::default();
         let garbage = b"this is not a PDF at all and never will be ever".to_vec();
-        let result = parse_pdf_with_backends(garbage, &config, None).await;
+        let result = parse_pdf_with_backends_mode(
+            garbage,
+            &config,
+            None,
+            crate::config::PaddleOcrMode::Fallback,
+        )
+        .await;
         assert!(result.is_err());
+    }
+
+    // ── Auto mode dispatch ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_mode_routes_text_simple_to_pdf_oxide() {
+        let config = ocr::OcrConfig::default();
+        let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
+        let result = parse_pdf_with_backends_mode(
+            bytes,
+            &config,
+            None,
+            crate::config::PaddleOcrMode::Auto,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.document.metadata.routed_to, Some("pdf_oxide"));
+        let cls = result
+            .document
+            .metadata
+            .classification
+            .expect("auto should always populate classification");
+        assert_eq!(
+            cls.class,
+            crate::services::pdf_classifier::PdfClass::TextSimple
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_to_pdf_oxide_when_paddle_unconfigured() {
+        // table_document.pdf classifies as TextStructured, but with no
+        // paddle_cfg the Auto path must gracefully degrade to pdf_oxide.
+        let config = ocr::OcrConfig::default();
+        let bytes = include_bytes!("../../tests/fixtures/table_document.pdf").to_vec();
+        let result = parse_pdf_with_backends_mode(
+            bytes,
+            &config,
+            None,
+            crate::config::PaddleOcrMode::Auto,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.document.metadata.routed_to, Some("pdf_oxide"));
+        let cls = result.document.metadata.classification.unwrap();
+        assert_eq!(
+            cls.class,
+            crate::services::pdf_classifier::PdfClass::TextStructured
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_mode_tags_result_with_pdf_oxide() {
+        // Sanity: non-Auto modes also set routed_to for observability.
+        let config = ocr::OcrConfig::default();
+        let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
+        let result = parse_pdf_with_backends_mode(
+            bytes,
+            &config,
+            None,
+            crate::config::PaddleOcrMode::Fallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.document.metadata.routed_to, Some("pdf_oxide"));
+        assert!(
+            result.document.metadata.classification.is_none(),
+            "classification only runs in Auto mode"
+        );
     }
 
     #[tokio::test]
     async fn parse_pdf_with_fallback_recovers_scanned_pdf_via_ocr() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
-        let result = parse_pdf_with_backends(bytes, &config, None).await;
+        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback).await;
         assert!(
             result.is_ok(),
             "scanned PDF must recover via OCR: {result:?}"
@@ -1122,7 +1273,7 @@ mod tests {
     async fn parse_pdf_handles_multipage_report() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
-        let result = parse_pdf_with_backends(bytes, &config, None).await;
+        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback).await;
         assert!(result.is_ok(), "multipage PDF must parse: {result:?}");
         let parsed = result.unwrap();
         assert_eq!(parsed.document.metadata.page_count, 3);

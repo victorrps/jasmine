@@ -45,13 +45,15 @@ Then in `.env`:
 ```
 PADDLEOCR_URL=http://localhost:8868
 PADDLEOCR_TIMEOUT_SECS=120
-PADDLEOCR_MODE=fallback   # or "primary"
+# PADDLEOCR_MODE defaults to "auto" whenever PADDLEOCR_URL is set.
+# Explicit override: "auto" | "primary" | "fallback"
 ```
 
 **Routing modes:**
 
-- `fallback` (default) — `pdf_oxide` handles every PDF first; PaddleOCR is called only when the document is scanned or native extraction fails. Tesseract remains the final fallback.
-- `primary` — PaddleOCR PP-StructureV3 runs on every PDF (layout-aware markdown with tables and headings); `pdf_oxide` is used only if the sidecar fails.
+- `auto` (default when `PADDLEOCR_URL` is set) — classify the document first, then route: plain prose → `pdf_oxide` only, structured (tables, forms, multi-column) → Paddle, scanned/image-only → OCR chain. The response envelope exposes the routing decision under `document.metadata.classification` and `document.metadata.routed_to` so operators can audit every request.
+- `fallback` (default when `PADDLEOCR_URL` is unset) — `pdf_oxide` handles every PDF first; PaddleOCR is called only when the document is detected as scanned. Tesseract is the final fallback.
+- `primary` — PaddleOCR PP-StructureV3 runs on every PDF regardless of content; `pdf_oxide` is used only if the sidecar fails. Highest quality for structured docs, slowest for plain text.
 
 Multi-page PDFs are stitched on the sidecar via PP-StructureV3's own `concatenate_markdown_pages` (§2.2 of the official docs), which preserves image references and cross-page tables.
 
@@ -140,7 +142,7 @@ curl http://localhost:8080/billing/plans
 | `JWT_EXPIRY_MINUTES` | optional | default `15` |
 | `PADDLEOCR_URL` | optional | e.g. `http://localhost:8868` |
 | `PADDLEOCR_TIMEOUT_SECS` | optional | default `120` |
-| `PADDLEOCR_MODE` | optional | `fallback` (default) or `primary` — see PaddleOCR section |
+| `PADDLEOCR_MODE` | optional | `auto` \| `primary` \| `fallback` — defaults to `auto` when `PADDLEOCR_URL` is set, else `fallback`. See PaddleOCR section. |
 | `ANTHROPIC_API_KEY` | optional | enables Claude Haiku schema extraction |
 | `STRIPE_SECRET_KEY` | optional | enables Stripe billing |
 | `STRIPE_WEBHOOK_SECRET` | optional | required to accept `/billing/webhook` calls |
@@ -207,12 +209,16 @@ All PDFs under `tests/fixtures/` are fully synthetic. Regenerate with:
 
 | Fixture | Covers |
 |---|---|
-| `sample.pdf` | 1-page text invoice (baseline) |
+| `sample.pdf` | 1-page labeled invoice (baseline) |
 | `multipage_report.pdf` | 3-page native text (multi-page stitching) |
+| `long_article.pdf` | 10-page prose article (long `TextSimple`) |
+| `ordinal_dates.pdf` | Prose with ordinal date suffixes |
 | `form_with_labels.pdf` | Labeled fields (label/heading logic) |
 | `table_document.pdf` | Native text with a bordered table |
-| `ordinal_dates.pdf` | Dates with ordinal suffixes (superscript artifact tests) |
-| `scanned_form.pdf` | Image-only PDF (triggers `is_scanned` → OCR path) |
+| `two_column_article.pdf` | Two-column newspaper layout (column alignment) |
+| `mixed_content.pdf` | Prose + labeled metadata + table on same page |
+| `scanned_form.pdf` | Single-page image-only PDF (`is_scanned` → OCR path) |
+| `long_scanned.pdf` | 3-page image-only PDF (multi-page OCR path) |
 
 ## License
 

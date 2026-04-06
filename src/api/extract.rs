@@ -107,10 +107,11 @@ pub async fn extract_pdf(
             config.paddleocr_timeout_secs,
         )
     });
-    let parse_result = pdf_parser::parse_pdf_with_backends(
+    let parse_result = pdf_parser::parse_pdf_with_backends_mode(
         bytes,
         &ocr_config,
         paddle_config.as_ref(),
+        config.paddleocr_mode,
     )
     .await?;
 
