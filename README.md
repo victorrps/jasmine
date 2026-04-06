@@ -104,13 +104,39 @@ curl -X DELETE http://localhost:8080/api-keys/<key_id> -H "Authorization: Bearer
 curl -X POST http://localhost:8080/v1/parse \
   -H "X-API-Key: df_live_..." \
   -F "file=@document.pdf"
+
+# Optional: tell the server what you think the document is. The hint wins
+# on disagreement with the auto-detector (see doc_type_detector.rs).
+curl -X POST http://localhost:8080/v1/parse \
+  -H "X-API-Key: df_live_..." \
+  -F "file=@document.pdf" \
+  -F "document_type_hint=invoice"
 ```
+
+**Document-type fields in the response** (all optional, omitted when absent):
+
+| Field | Meaning |
+|---|---|
+| `detected_type` | Auto-detected type, e.g. `invoice`, `report`, `article`, `form`. `None` when the detector is not confident. |
+| `detected_type_confidence` | Normalized confidence in `[0, 1]`. |
+| `detected_type_alternates` | Up to 2 runner-up types with their confidences. |
+| `document_type_hint` | Echo of the caller-supplied hint after parsing. |
+| `document_type` | Effective type after reconciliation (hint wins). |
+| `document_type_source` | `"hint"` or `"detector"`. |
+
+Accepted hint values: `invoice`, `receipt`, `contract`, `resume` (or `cv`),
+`bank_statement`, `letter`, `invitation`, `report`, `purchase_order` (or
+`po`), `quote` (or `estimate`), `academic_paper` (or `paper`), `article`
+(or `news`), `form`, `other`. Unknown values are logged and ignored.
+Compliance-sensitive types (`medical_record`, `id_document`, `tax_form`)
+are intentionally excluded — see `docs/DEFERRED_DOC_TYPE_LEARNING.md`.
 
 ### Extract (schema-driven)
 ```bash
 curl -X POST http://localhost:8080/v1/extract \
   -H "X-API-Key: df_live_..." \
   -F "file=@invoice.pdf" \
+  -F "document_type_hint=invoice" \
   -F 'schema={"type":"object","properties":{"invoice_number":{"type":"string"},"amount":{"type":"number"}}}'
 ```
 

@@ -9,6 +9,7 @@ use crate::config::AppConfig;
 use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
 use crate::models;
+use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
 use crate::services::{ocr, pdf_parser, schema_extractor};
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
@@ -43,6 +44,7 @@ pub async fn extract_pdf(
 
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut schema_str: Option<String> = None;
+    let mut document_type_hint: Option<DocType> = None;
 
     while let Some(item) = payload.next().await {
         let mut field = item.map_err(|e| {
@@ -52,10 +54,15 @@ pub async fn extract_pdf(
 
         let field_name = field.name().map(|n| n.to_string()).unwrap_or_default();
 
-        let size_limit = if field_name == "schema" {
-            MAX_SCHEMA_SIZE
-        } else {
-            MAX_FILE_SIZE
+        let size_limit = match field_name.as_str() {
+            "schema" => MAX_SCHEMA_SIZE,
+            "document_type_hint" => MAX_HINT_BYTES,
+            "file" => MAX_FILE_SIZE,
+            other => {
+                return Err(AppError::Validation(format!(
+                    "Unexpected multipart field: {other}"
+                )));
+            }
         };
         let mut data = Vec::new();
         while let Some(chunk) = field.next().await {
@@ -64,12 +71,19 @@ pub async fn extract_pdf(
                 AppError::Validation("Failed to read uploaded file".into())
             })?;
             if data.len() + bytes.len() > size_limit {
-                if field_name == "schema" {
-                    return Err(AppError::Validation(
-                        "Schema exceeds maximum size of 64KB".into(),
-                    ));
+                match field_name.as_str() {
+                    "schema" => {
+                        return Err(AppError::Validation(
+                            "Schema exceeds maximum size of 64KB".into(),
+                        ))
+                    }
+                    "document_type_hint" => {
+                        return Err(AppError::Validation(
+                            "document_type_hint is too long".into(),
+                        ))
+                    }
+                    _ => return Err(AppError::FileTooLarge),
                 }
-                return Err(AppError::FileTooLarge);
             }
             data.extend_from_slice(&bytes);
         }
@@ -82,7 +96,21 @@ pub async fn extract_pdf(
                         .map_err(|_| AppError::Validation("Schema must be valid UTF-8".into()))?,
                 );
             }
-            _ => {}
+            "document_type_hint" => {
+                let s = String::from_utf8(data).map_err(|_| {
+                    AppError::Validation("document_type_hint must be valid UTF-8".into())
+                })?;
+                document_type_hint = DocType::from_hint_str(&s);
+                if document_type_hint.is_none() && !s.trim().is_empty() {
+                    tracing::info!(
+                        raw = %s.escape_debug(),
+                        "document_type_hint could not be parsed into a known type; ignoring"
+                    );
+                }
+            }
+            // Unknown field names are already rejected above when computing
+            // `size_limit`, so this arm is unreachable.
+            _ => unreachable!("unknown field names are rejected earlier"),
         }
     }
 
@@ -112,6 +140,7 @@ pub async fn extract_pdf(
         &ocr_config,
         paddle_config.as_ref(),
         config.paddleocr_mode,
+        document_type_hint,
     )
     .await?;
 

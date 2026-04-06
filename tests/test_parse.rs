@@ -107,6 +107,38 @@ fn build_multipart_pdf(pdf_bytes: &[u8]) -> (String, Vec<u8>) {
     (boundary.to_string(), body)
 }
 
+fn build_multipart_pdf_with_hint(pdf_bytes: &[u8], hint: &str) -> (String, Vec<u8>) {
+    let boundary = "----TestBoundary12345";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"test.pdf\"\r\n",
+    );
+    body.extend_from_slice(b"Content-Type: application/pdf\r\n\r\n");
+    body.extend_from_slice(pdf_bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"document_type_hint\"\r\n\r\n");
+    body.extend_from_slice(hint.as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (boundary.to_string(), body)
+}
+
+fn build_multipart_with_unknown_field(pdf_bytes: &[u8]) -> (String, Vec<u8>) {
+    let boundary = "----TestBoundary12345";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"test.pdf\"\r\n",
+    );
+    body.extend_from_slice(b"Content-Type: application/pdf\r\n\r\n");
+    body.extend_from_slice(pdf_bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"surprise\"\r\n\r\n");
+    body.extend_from_slice(b"oops");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (boundary.to_string(), body)
+}
+
 #[actix_rt::test]
 async fn test_parse_valid_pdf() {
     let (app, api_key, _, _) = test_app_with_key!();
@@ -253,4 +285,83 @@ async fn test_extract_stub() {
 
     let result: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(result["extracted"]["model"], "stub");
+}
+
+#[actix_rt::test]
+async fn test_parse_document_type_hint_wins() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body) =
+        build_multipart_pdf_with_hint(&common::sample_pdf_bytes(), "quote");
+
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let result: serde_json::Value = test::read_body_json(resp).await;
+    let meta = &result["document"]["metadata"];
+    assert_eq!(meta["document_type_hint"], "quote");
+    assert_eq!(meta["document_type"], "quote");
+    assert_eq!(meta["document_type_source"], "hint");
+}
+
+#[actix_rt::test]
+async fn test_parse_unknown_hint_is_ignored() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body) = build_multipart_pdf_with_hint(
+        &common::sample_pdf_bytes(),
+        "not_a_real_type",
+    );
+
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let result: serde_json::Value = test::read_body_json(resp).await;
+    // Unknown hint is parsed to None → field is omitted via
+    // skip_serializing_if, the response must NOT carry a hint echo.
+    assert!(
+        result["document"]["metadata"]["document_type_hint"].is_null(),
+        "unknown hint should be dropped, not echoed back"
+    );
+}
+
+#[actix_rt::test]
+async fn test_parse_rejects_unknown_multipart_field() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body) = build_multipart_with_unknown_field(&common::sample_pdf_bytes());
+
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "unexpected multipart field must be rejected with 400"
+    );
 }

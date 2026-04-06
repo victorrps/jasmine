@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::time::Instant;
 
 use crate::errors::AppError;
+use super::doc_type_detector::{self, DocType, DocumentTypeSource, TypeAlternate};
 use super::ocr;
 
 /// Result of parsing a single PDF document.
@@ -54,7 +55,27 @@ pub struct DocumentMetadata {
     pub pdf_version: Option<String>,
     pub is_encrypted: bool,
     pub is_scanned: bool,
-    pub detected_type: Option<String>,
+    /// Auto-detected document type from extracted text. May be `None` if the
+    /// detector is not confident enough to commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_type: Option<DocType>,
+    /// Normalized confidence for `detected_type` in `[0.0, 1.0]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_type_confidence: Option<f64>,
+    /// Runner-up classifications with their confidences.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub detected_type_alternates: Vec<TypeAlternate>,
+    /// Customer-supplied `document_type_hint`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_type_hint: Option<DocType>,
+    /// Effective document type after reconciliation between hint and
+    /// detector. Hint wins on disagreement; see
+    /// `reconcile_document_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_type: Option<DocType>,
+    /// Where `document_type` came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_type_source: Option<DocumentTypeSource>,
     pub image_count: u32,
     pub processing_ms: u64,
     /// Client-facing classifier projection (only set when `PaddleOcrMode::Auto`
@@ -133,8 +154,11 @@ pub fn parse_pdf(bytes: Vec<u8>, pdftoppm_path: &str) -> Result<ParseResult, App
     // Extract tables from markdown
     let tables = extract_tables_from_markdown(&markdown);
 
-    // Detect document type by keyword heuristics
-    let detected_type = detect_document_type(&full_text);
+    // Detect document type using the weighted feature detector.
+    let detection = doc_type_detector::detect(&full_text);
+    log_detection(&detection);
+    let (detected_type, detected_type_confidence, detected_type_alternates) =
+        unpack_detection(&detection);
 
     let processing_ms = start.elapsed().as_millis() as u64;
 
@@ -150,6 +174,11 @@ pub fn parse_pdf(bytes: Vec<u8>, pdftoppm_path: &str) -> Result<ParseResult, App
                 is_encrypted: false,
                 is_scanned,
                 detected_type,
+                detected_type_confidence,
+                detected_type_alternates,
+                document_type_hint: None,
+                document_type: None,
+                document_type_source: None,
                 image_count: 0,
                 processing_ms,
                 classification: None,
@@ -161,6 +190,83 @@ pub fn parse_pdf(bytes: Vec<u8>, pdftoppm_path: &str) -> Result<ParseResult, App
             credits_used: page_count * 2,
         },
     })
+}
+
+/// Log the full per-type scores from the detector for server-side tuning.
+/// The raw scores never leave the process — they are not serialized into
+/// the API response.
+///
+/// **Phase 3 boundary (see `docs/DEFERRED_DOC_TYPE_LEARNING.md`)**: this is
+/// the single place where detector output lands in the tuning-telemetry
+/// feed. When the telemetry/learning phase ships, this is the line that
+/// needs to be gated behind a per-tenant opt-in, routed through a
+/// PII-scrubbing sink, and subject to a retention policy. Any new
+/// detection logging should go through this helper so the opt-in check
+/// has exactly one home.
+fn log_detection(detection: &doc_type_detector::DetectionResult) {
+    tracing::info!(
+        detected = ?detection.type_,
+        confidence = detection.confidence,
+        scores = ?detection.debug_scores,
+        "document type detection"
+    );
+}
+
+/// Split a `DetectionResult` into the triple stored on `DocumentMetadata`.
+fn unpack_detection(
+    detection: &doc_type_detector::DetectionResult,
+) -> (Option<DocType>, Option<f64>, Vec<TypeAlternate>) {
+    match detection.type_ {
+        Some(t) => (
+            Some(t),
+            Some(detection.confidence),
+            detection.alternates.clone(),
+        ),
+        None => (None, None, Vec::new()),
+    }
+}
+
+/// Reconcile a customer-supplied hint with the auto-detected type.
+///
+/// Semantics (option **b** from the Phase 1+2 plan):
+/// * Hint is provided → hint wins; `document_type_source = Hint`. If the
+///   detector disagrees with the hint, both are logged so tuning can learn
+///   from the disagreement without silently overriding the customer.
+/// * No hint, detector confident → use the detector;
+///   `document_type_source = Detector`.
+/// * No hint, no confident detection → `document_type = None`,
+///   `document_type_source = None`.
+fn reconcile_document_type(
+    hint: Option<DocType>,
+    detected: Option<DocType>,
+) -> (Option<DocType>, Option<DocumentTypeSource>) {
+    match (hint, detected) {
+        (Some(h), detected) => {
+            if let Some(d) = detected {
+                if d != h {
+                    tracing::info!(
+                        hint = ?h,
+                        detected = ?d,
+                        "document_type hint disagrees with detector; hint wins"
+                    );
+                }
+            }
+            (Some(h), Some(DocumentTypeSource::Hint))
+        }
+        (None, Some(d)) => (Some(d), Some(DocumentTypeSource::Detector)),
+        (None, None) => (None, None),
+    }
+}
+
+/// Stamp a `ParseResult` with the document-type hint and the reconciled
+/// effective type + source. Called by every dispatcher arm after the backend
+/// run completes.
+fn apply_document_type_hint(result: &mut ParseResult, hint: Option<DocType>) {
+    let detected = result.document.metadata.detected_type;
+    let (effective, source) = reconcile_document_type(hint, detected);
+    result.document.metadata.document_type_hint = hint;
+    result.document.metadata.document_type = effective;
+    result.document.metadata.document_type_source = source;
 }
 
 /// Returns true if the error is a structural PDF parsing failure that OCR can recover from.
@@ -201,6 +307,18 @@ fn finalize_ocr_result(
 
 /// Parse a PDF and dispatch to the right backend based on routing mode.
 pub async fn parse_pdf_with_backends_mode(
+    bytes: Vec<u8>,
+    ocr_config: &ocr::OcrConfig,
+    paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
+    mode: crate::config::PaddleOcrMode,
+    document_type_hint: Option<DocType>,
+) -> Result<ParseResult, AppError> {
+    let mut result = dispatch_inner(bytes, ocr_config, paddle_config, mode).await?;
+    apply_document_type_hint(&mut result, document_type_hint);
+    Ok(result)
+}
+
+async fn dispatch_inner(
     bytes: Vec<u8>,
     ocr_config: &ocr::OcrConfig,
     paddle_config: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
@@ -431,7 +549,10 @@ fn build_result_from_ocr(ocr_result: ocr::OcrResult) -> ParseResult {
         ocr_result.markdown
     };
     let tables = extract_tables_from_markdown(&markdown);
-    let detected_type = detect_document_type(&ocr_result.text);
+    let detection = doc_type_detector::detect(&ocr_result.text);
+    log_detection(&detection);
+    let (detected_type, detected_type_confidence, detected_type_alternates) =
+        unpack_detection(&detection);
 
     ParseResult {
         document: DocumentResult {
@@ -445,6 +566,11 @@ fn build_result_from_ocr(ocr_result: ocr::OcrResult) -> ParseResult {
                 is_encrypted: false,
                 is_scanned: true,
                 detected_type,
+                detected_type_confidence,
+                detected_type_alternates,
+                document_type_hint: None,
+                document_type: None,
+                document_type_source: None,
                 image_count: 0,
                 processing_ms: ocr_result.processing_ms,
                 classification: None,
@@ -533,109 +659,6 @@ fn parse_table_row(line: &str) -> Vec<String> {
         .map(|cell| cell.trim().to_string())
         .filter(|cell| !cell.is_empty())
         .collect()
-}
-
-/// Detect document type using keyword heuristics on the first 2000 chars.
-/// Normalizes whitespace to handle PDF extraction artifacts.
-fn detect_document_type(text: &str) -> Option<String> {
-    let sample: String = text.chars().take(2000).collect();
-    // Normalize multiple whitespace chars to single space for robust matching
-    let lower: String = sample
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let patterns: &[(&str, &[&str])] = &[
-        (
-            "invoice",
-            &[
-                "invoice",
-                "bill to",
-                "amount due",
-                "payment terms",
-                "due date",
-            ],
-        ),
-        (
-            "receipt",
-            &[
-                "receipt",
-                "total paid",
-                "payment received",
-                "thank you for your",
-            ],
-        ),
-        (
-            "contract",
-            &["agreement", "whereas", "hereby", "parties", "shall"],
-        ),
-        (
-            "resume",
-            &[
-                "experience",
-                "education",
-                "skills",
-                "objective",
-                "references",
-            ],
-        ),
-        (
-            "bank_statement",
-            &[
-                "statement",
-                "balance",
-                "withdrawal",
-                "deposit",
-                "account number",
-            ],
-        ),
-        (
-            "letter",
-            &[
-                "dear",
-                "sincerely",
-                "regards",
-                "kindest regards",
-                "to whom it may concern",
-            ],
-        ),
-        (
-            "invitation",
-            &[
-                "invite",
-                "invitation",
-                "visit",
-                "residence",
-                "stay",
-                "immigration",
-            ],
-        ),
-        (
-            "report",
-            &[
-                "report",
-                "findings",
-                "conclusion",
-                "summary",
-                "analysis",
-                "recommendation",
-            ],
-        ),
-    ];
-
-    let mut best_match = None;
-    let mut best_score = 0;
-
-    for &(doc_type, keywords) in patterns {
-        let score = keywords.iter().filter(|kw| lower.contains(**kw)).count();
-        if score >= 2 && score > best_score {
-            best_score = score;
-            best_match = Some(doc_type.to_string());
-        }
-    }
-
-    best_match
 }
 
 /// Fix common PDF extraction artifacts where superscript ordinal suffixes
@@ -807,31 +830,8 @@ mod tests {
         assert!(!is_superscript_fragment("the"));
     }
 
-    // ── Document type detection tests ────────────────────────────────────────
-
-    #[test]
-    fn test_detect_document_type_invitation() {
-        let text = "I wish to invite my brother to visit and stay at my residence during his trip. Immigration officer.";
-        assert_eq!(detect_document_type(text), Some("invitation".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_letter() {
-        let text = "Dear Mr. Smith,\n\nThank you for your inquiry.\n\nKindest regards,\nJane Doe";
-        assert_eq!(detect_document_type(text), Some("letter".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_invoice() {
-        let text = "Invoice #1234\nBill To: Acme Corp\nAmount Due: $500\nPayment Terms: Net 30";
-        assert_eq!(detect_document_type(text), Some("invoice".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_unknown() {
-        let text = "Hello world, this is a random document.";
-        assert_eq!(detect_document_type(text), None);
-    }
+    // Document-type detection now lives in `doc_type_detector` with its own
+    // unit + fixture-driven tests.
 
     #[test]
     fn test_scan_detection_logic() {
@@ -945,62 +945,6 @@ mod tests {
     fn test_build_markdown_empty_pages_is_empty() {
         let md = build_markdown(&[]);
         assert!(md.is_empty(), "empty pages must produce empty markdown");
-    }
-
-    #[test]
-    fn test_detect_document_type_contract() {
-        let text =
-            "This Agreement is entered into whereas the parties hereby agree shall be bound.";
-        assert_eq!(detect_document_type(text), Some("contract".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_resume() {
-        let text =
-            "Work Experience\nEducation: BSc CS\nSkills: Rust Python\nObjective: Senior role.";
-        assert_eq!(detect_document_type(text), Some("resume".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_bank_statement() {
-        let text = "Account Number: 1234\nStatement Date: Jan 2025\nBalance: $5000\nWithdrawal: $200\nDeposit: $1000";
-        assert_eq!(detect_document_type(text), Some("bank_statement".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_receipt() {
-        let text =
-            "Receipt #007\nTotal paid: $150.00\nPayment received. Thank you for your business.";
-        assert_eq!(detect_document_type(text), Some("receipt".into()));
-    }
-
-    #[test]
-    fn test_detect_document_type_needs_two_matching_keywords() {
-        // Only one invoice keyword — must not match
-        let text = "Invoice for services";
-        assert_eq!(
-            detect_document_type(text),
-            None,
-            "single keyword should not match"
-        );
-    }
-
-    #[test]
-    fn test_detect_document_type_uses_only_first_2000_chars() {
-        // Place contract keywords at position > 2000 — should not match
-        let padding = "x".repeat(2100);
-        let text = format!("{padding} agreement whereas parties hereby shall");
-        assert_eq!(
-            detect_document_type(&text),
-            None,
-            "keywords beyond 2000 chars must not be detected"
-        );
-    }
-
-    #[test]
-    fn test_detect_document_type_is_case_insensitive() {
-        let text = "INVOICE #001\nBILL TO: Corp\nAMOUNT DUE: $100\nPAYMENT TERMS: Net 30";
-        assert_eq!(detect_document_type(text), Some("invoice".into()));
     }
 
     #[test]
@@ -1181,7 +1125,7 @@ mod tests {
         let result = build_result_from_ocr(ocr_result);
         assert_eq!(
             result.document.metadata.detected_type,
-            Some("invoice".into())
+            Some(DocType::Invoice)
         );
     }
 
@@ -1202,7 +1146,7 @@ mod tests {
     async fn parse_pdf_with_fallback_succeeds_for_valid_pdf() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback).await;
+        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback, None).await;
         assert!(result.is_ok(), "valid PDF must parse: {result:?}");
         let parsed = result.unwrap();
         assert!(parsed.document.metadata.page_count > 0);
@@ -1217,6 +1161,7 @@ mod tests {
             &config,
             None,
             crate::config::PaddleOcrMode::Fallback,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1233,6 +1178,7 @@ mod tests {
             &config,
             None,
             crate::config::PaddleOcrMode::Auto,
+            None,
         )
         .await
         .unwrap();
@@ -1259,6 +1205,7 @@ mod tests {
             &config,
             None,
             crate::config::PaddleOcrMode::Auto,
+            None,
         )
         .await
         .unwrap();
@@ -1281,6 +1228,7 @@ mod tests {
             &config,
             None,
             crate::config::PaddleOcrMode::Auto,
+            None,
         )
         .await
         .unwrap();
@@ -1310,6 +1258,7 @@ mod tests {
             &config,
             None,
             crate::config::PaddleOcrMode::Fallback,
+            None,
         )
         .await
         .unwrap();
@@ -1324,7 +1273,7 @@ mod tests {
     async fn parse_pdf_with_fallback_recovers_scanned_pdf_via_ocr() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback).await;
+        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback, None).await;
         assert!(
             result.is_ok(),
             "scanned PDF must recover via OCR: {result:?}"
@@ -1344,11 +1293,108 @@ mod tests {
     async fn parse_pdf_handles_multipage_report() {
         let config = ocr::OcrConfig::default();
         let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
-        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback).await;
+        let result = parse_pdf_with_backends_mode(bytes, &config, None, crate::config::PaddleOcrMode::Fallback, None).await;
         assert!(result.is_ok(), "multipage PDF must parse: {result:?}");
         let parsed = result.unwrap();
         assert_eq!(parsed.document.metadata.page_count, 3);
         assert!(parsed.document.text.contains("Section 1"));
         assert!(parsed.document.text.contains("Section 3"));
+    }
+
+    // ── Document-type detection: fixture-driven oracle ──────────────────
+
+    /// For each fixture we assert either a specific detected_type or that
+    /// the detector refused to guess (None). The acceptable-None fixtures
+    /// are short/structured/scanned samples where the detector should
+    /// legitimately not commit.
+    #[test]
+    fn fixture_oracle_sample_invoice() {
+        let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
+        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        assert_eq!(r.document.metadata.detected_type, Some(DocType::Invoice));
+    }
+
+    #[test]
+    fn fixture_oracle_multipage_report_is_report_or_none() {
+        let bytes = include_bytes!("../../tests/fixtures/multipage_report.pdf").to_vec();
+        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        // Report or None are both acceptable outcomes — the important
+        // thing is that the old "stringly-typed" noise is gone.
+        match r.document.metadata.detected_type {
+            Some(DocType::Report) | None => {}
+            other => panic!("unexpected detected_type: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixture_oracle_long_article_is_article_or_none() {
+        let bytes = include_bytes!("../../tests/fixtures/long_article.pdf").to_vec();
+        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        match r.document.metadata.detected_type {
+            Some(DocType::Article) | None => {}
+            other => panic!("unexpected detected_type: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixture_oracle_form_with_labels_is_form_or_none() {
+        let bytes = include_bytes!("../../tests/fixtures/form_with_labels.pdf").to_vec();
+        let r = parse_pdf(bytes, "pdftoppm").unwrap();
+        match r.document.metadata.detected_type {
+            Some(DocType::Form) | None => {}
+            other => panic!("unexpected detected_type: {other:?}"),
+        }
+    }
+
+    // ── Hint reconciliation (option b: hint wins) ───────────────────────
+
+    #[test]
+    fn hint_overrides_detector_when_they_disagree() {
+        let detected = Some(DocType::Invoice);
+        let hint = Some(DocType::Receipt);
+        let (effective, source) = reconcile_document_type(hint, detected);
+        assert_eq!(effective, Some(DocType::Receipt));
+        assert_eq!(source, Some(DocumentTypeSource::Hint));
+    }
+
+    #[test]
+    fn hint_present_with_no_detection_still_wins() {
+        let (effective, source) = reconcile_document_type(Some(DocType::Contract), None);
+        assert_eq!(effective, Some(DocType::Contract));
+        assert_eq!(source, Some(DocumentTypeSource::Hint));
+    }
+
+    #[test]
+    fn detector_wins_when_no_hint() {
+        let (effective, source) = reconcile_document_type(None, Some(DocType::Invoice));
+        assert_eq!(effective, Some(DocType::Invoice));
+        assert_eq!(source, Some(DocumentTypeSource::Detector));
+    }
+
+    #[test]
+    fn neither_hint_nor_detection_yields_none() {
+        let (effective, source) = reconcile_document_type(None, None);
+        assert_eq!(effective, None);
+        assert_eq!(source, None);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_threads_document_type_hint_into_metadata() {
+        let config = ocr::OcrConfig::default();
+        let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
+        let result = parse_pdf_with_backends_mode(
+            bytes,
+            &config,
+            None,
+            crate::config::PaddleOcrMode::Fallback,
+            Some(DocType::Quote),
+        )
+        .await
+        .unwrap();
+        let m = &result.document.metadata;
+        assert_eq!(m.document_type_hint, Some(DocType::Quote));
+        // Hint wins, regardless of what the detector guessed.
+        assert_eq!(m.document_type, Some(DocType::Quote));
+        assert_eq!(m.document_type_source, Some(DocumentTypeSource::Hint));
     }
 }

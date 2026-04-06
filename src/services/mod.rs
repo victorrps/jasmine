@@ -1,4 +1,5 @@
 pub mod billing;
+pub mod doc_type_detector;
 pub mod markdown_cleaner;
 pub mod ocr;
 pub mod paddle_ocr;

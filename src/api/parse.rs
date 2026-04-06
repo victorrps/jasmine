@@ -9,6 +9,7 @@ use crate::config::AppConfig;
 use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
 use crate::models;
+use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
 use crate::services::{ocr, pdf_parser};
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
@@ -39,7 +40,7 @@ pub async fn parse_pdf(
         )));
     }
 
-    let bytes = extract_pdf_bytes(&mut payload).await?;
+    let (bytes, document_type_hint) = extract_parse_upload(&mut payload).await?;
 
     let ocr_config = ocr::OcrConfig {
         tesseract_path: config.tesseract_path.clone(),
@@ -56,6 +57,7 @@ pub async fn parse_pdf(
         &ocr_config,
         paddle_config.as_ref(),
         config.paddleocr_mode,
+        document_type_hint,
     )
     .await?;
 
@@ -94,35 +96,75 @@ pub async fn parse_pdf(
     }))
 }
 
-/// Extract and validate PDF bytes from a multipart upload.
-pub async fn extract_pdf_bytes(payload: &mut Multipart) -> Result<Vec<u8>, AppError> {
-    let mut bytes = Vec::new();
+/// Read a parse upload: PDF bytes plus an optional `document_type_hint`
+/// field.
+///
+/// Accepted field names:
+/// * `file` or an unnamed first field → PDF payload
+/// * `document_type_hint` → optional type hint (see `DocType::from_hint_str`)
+///
+/// Any other named field is rejected with `AppError::Validation` so the
+/// wire contract stays narrow and consistent with `/v1/extract`.
+pub async fn extract_parse_upload(
+    payload: &mut Multipart,
+) -> Result<(Vec<u8>, Option<DocType>), AppError> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut hint: Option<DocType> = None;
 
-    if let Some(item) = payload.next().await {
+    while let Some(item) = payload.next().await {
         let mut field = item.map_err(|e| {
             tracing::warn!(error = %e, "Multipart field error");
             AppError::Validation("Invalid file upload".into())
         })?;
 
+        let field_name = field.name().map(|n| n.to_string()).unwrap_or_default();
+        let is_hint = field_name == "document_type_hint";
+        let is_file = field_name.is_empty() || field_name == "file";
+        if !is_hint && !is_file {
+            return Err(AppError::Validation(format!(
+                "Unexpected multipart field: {field_name}"
+            )));
+        }
+        let size_limit = if is_hint { MAX_HINT_BYTES } else { MAX_FILE_SIZE };
+
+        let mut data = Vec::new();
         while let Some(chunk) = field.next().await {
-            let data = chunk.map_err(|e| {
+            let bytes = chunk.map_err(|e| {
                 tracing::warn!(error = %e, "Multipart chunk read error");
                 AppError::Validation("Failed to read uploaded file".into())
             })?;
-            if bytes.len() + data.len() > MAX_FILE_SIZE {
+            if data.len() + bytes.len() > size_limit {
+                if is_hint {
+                    return Err(AppError::Validation(
+                        "document_type_hint is too long".into(),
+                    ));
+                }
                 return Err(AppError::FileTooLarge);
             }
-            bytes.extend_from_slice(&data);
+            data.extend_from_slice(&bytes);
+        }
+
+        if is_hint {
+            let s = String::from_utf8(data).map_err(|_| {
+                AppError::Validation("document_type_hint must be valid UTF-8".into())
+            })?;
+            hint = DocType::from_hint_str(&s);
+            if hint.is_none() && !s.trim().is_empty() {
+                // escape_debug prevents ANSI / control chars in a crafted
+                // hint from muddying log viewers.
+                tracing::info!(
+                    raw = %s.escape_debug(),
+                    "document_type_hint could not be parsed into a known type; ignoring"
+                );
+            }
+        } else if file_bytes.is_none() {
+            file_bytes = Some(data);
         }
     }
 
-    if bytes.is_empty() {
-        return Err(AppError::Validation("No file uploaded".into()));
-    }
-
+    let bytes = file_bytes.ok_or_else(|| AppError::Validation("No file uploaded".into()))?;
     if bytes.len() < 64 || &bytes[..5] != PDF_MAGIC {
         return Err(AppError::InvalidPdf);
     }
-
-    Ok(bytes)
+    Ok((bytes, hint))
 }
