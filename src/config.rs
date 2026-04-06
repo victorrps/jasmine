@@ -42,6 +42,12 @@ pub struct AppConfig {
     /// in-flight `spawn_blocking` work; the concurrency cap above is what
     /// prevents stuck tasks from compounding.
     pub parse_deadline_secs: u64,
+    /// Maximum length, in chars, of the markdown input passed to Claude
+    /// for `/v1/extract`. Hard ceiling — requests above this are rejected
+    /// with `413 Payload Too Large` (`code: EXTRACT_INPUT_TOO_LARGE`)
+    /// rather than silently truncated. Default 200_000 chars
+    /// (~50 K tokens). Set lower to bound your Anthropic spend per call.
+    pub extract_max_input_chars: usize,
 }
 
 /// Backend routing mode for PaddleOCR.
@@ -156,6 +162,14 @@ impl AppConfig {
             anyhow::bail!("PARSE_DEADLINE_SECS must be greater than 0");
         }
 
+        let extract_max_input_chars: usize = get("EXTRACT_MAX_INPUT_CHARS")
+            .unwrap_or_else(|| "200000".into())
+            .parse()
+            .context("EXTRACT_MAX_INPUT_CHARS must be a valid usize")?;
+        if extract_max_input_chars == 0 {
+            anyhow::bail!("EXTRACT_MAX_INPUT_CHARS must be greater than 0");
+        }
+
         Ok(Self {
             host: get("HOST").unwrap_or_else(|| "127.0.0.1".into()),
             port,
@@ -174,6 +188,7 @@ impl AppConfig {
             paddleocr_mode,
             max_concurrent_parses,
             parse_deadline_secs,
+            extract_max_input_chars,
         })
     }
 }
@@ -424,6 +439,27 @@ mod tests {
         vars.insert("PARSE_DEADLINE_SECS".into(), "30".into());
         let cfg = AppConfig::from_vars(&vars).unwrap();
         assert_eq!(cfg.parse_deadline_secs, 30);
+    }
+
+    #[test]
+    fn extract_max_input_chars_defaults_to_200_000() {
+        let cfg = AppConfig::from_vars(&base_vars()).unwrap();
+        assert_eq!(cfg.extract_max_input_chars, 200_000);
+    }
+
+    #[test]
+    fn extract_max_input_chars_parses_custom_value() {
+        let mut vars = base_vars();
+        vars.insert("EXTRACT_MAX_INPUT_CHARS".into(), "50000".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.extract_max_input_chars, 50_000);
+    }
+
+    #[test]
+    fn extract_max_input_chars_rejects_zero() {
+        let mut vars = base_vars();
+        vars.insert("EXTRACT_MAX_INPUT_CHARS".into(), "0".into());
+        assert!(AppConfig::from_vars(&vars).is_err());
     }
 
     #[test]

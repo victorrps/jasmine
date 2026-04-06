@@ -56,6 +56,32 @@ pub enum RoutedTo {
     Tesseract,
 }
 
+/// Soft-warning surfaced in `metadata.warnings` when the dispatcher had
+/// to compromise on its preferred path. The wire format is the snake_case
+/// string of the variant — typed in code, stable on the wire.
+///
+/// Customers parsing the response can branch on these to know whether
+/// their "structured" doc was actually OCR'd, whether the text layer was
+/// suspiciously thin, etc. Without this field, backend degradation is
+/// silent and surprising.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseWarning {
+    /// PaddleOCR was preferred but failed (network error, empty result,
+    /// or sidecar exception); Tesseract recovered.
+    PaddleDegradedToTesseract,
+    /// PaddleOCR returned an empty result and we kept the pdf_oxide
+    /// output rather than degrading further.
+    PaddleReturnedEmpty,
+    /// pdf_oxide produced very little text on a doc that did NOT
+    /// classify as scanned. Caller may want to retry with a different
+    /// mode or inspect the source PDF.
+    PdfOxideTextSuspiciouslyLow,
+    /// One or more OCR backends emitted a runtime warning during
+    /// processing (forwarded from `OcrResult.warning`).
+    OcrBackendWarning,
+}
+
 /// Document-level metadata.
 #[derive(Debug, Serialize)]
 pub struct DocumentMetadata {
@@ -94,6 +120,12 @@ pub struct DocumentMetadata {
     /// dispatcher picked a backend (i.e. from `parse_pdf_with_backends_mode`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_to: Option<RoutedTo>,
+    /// Soft warnings about backend degradation, low text quality, etc.
+    /// Empty on the happy path. See [`ParseWarning`] for the controlled
+    /// vocabulary. Skipped from serialization when empty so existing
+    /// clients see no shape change.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ParseWarning>,
 }
 
 /// Credits and pages processed.
@@ -204,6 +236,7 @@ pub fn parse_pdf(bytes: &[u8], pdftoppm_path: &str) -> Result<ParseResult, AppEr
                 processing_ms,
                 classification: None,
                 routed_to: None,
+                warnings: Vec::new(),
             },
         },
         usage: UsageInfo {
@@ -279,6 +312,38 @@ fn reconcile_document_type(
     }
 }
 
+/// Threshold for `PdfOxideTextSuspiciouslyLow`. Picked to be loose enough
+/// that legitimately short docs (single-page receipts, business cards)
+/// don't trip it but tight enough to flag PDFs where pdf_oxide silently
+/// returned almost nothing on a doc that did NOT classify as scanned.
+const PDF_OXIDE_LOW_TEXT_THRESHOLD: usize = 200;
+
+/// Append `PdfOxideTextSuspiciouslyLow` to a pdf_oxide result whose total
+/// text is suspiciously sparse on a non-scanned, multi-page doc. Idempotent
+/// — safe to call repeatedly.
+fn maybe_warn_low_text(result: &mut ParseResult) {
+    if result.document.metadata.is_scanned {
+        return;
+    }
+    if result.document.metadata.page_count < 2 {
+        return;
+    }
+    let total_chars: usize = result.document.pages.iter().map(|p| p.char_count).sum();
+    if total_chars < PDF_OXIDE_LOW_TEXT_THRESHOLD
+        && !result
+            .document
+            .metadata
+            .warnings
+            .contains(&ParseWarning::PdfOxideTextSuspiciouslyLow)
+    {
+        result
+            .document
+            .metadata
+            .warnings
+            .push(ParseWarning::PdfOxideTextSuspiciouslyLow);
+    }
+}
+
 /// Stamp a `ParseResult` with the document-type hint and the reconciled
 /// effective type + source. Called by every dispatcher arm after the backend
 /// run completes.
@@ -327,10 +392,12 @@ fn is_ocr_recoverable(err: &AppError) -> bool {
 
 /// Output of the OCR backend chain — includes which engine actually produced
 /// the result so the caller can tag `routed_to` accurately (rather than
-/// guessing "paddle iff paddle_cfg.is_some()").
+/// guessing "paddle iff paddle_cfg.is_some()") plus any soft warnings the
+/// chain accumulated (e.g. Paddle failed and Tesseract recovered).
 struct OcrBackendOutcome {
     result: ocr::OcrResult,
     backend: RoutedTo,
+    warnings: Vec<ParseWarning>,
 }
 
 /// Stamp an OCR result with classification + routing metadata and return the
@@ -339,10 +406,19 @@ fn finalize_ocr_result(
     ocr_result: ocr::OcrResult,
     classification: Option<super::pdf_classifier::ClassificationSummary>,
     routed_to: RoutedTo,
+    warnings: Vec<ParseWarning>,
 ) -> ParseResult {
+    let backend_warning = ocr_result.warning.is_some();
     let mut pr = build_result_from_ocr(ocr_result);
     pr.document.metadata.classification = classification;
     pr.document.metadata.routed_to = Some(routed_to);
+    pr.document.metadata.warnings = warnings;
+    if backend_warning {
+        pr.document
+            .metadata
+            .warnings
+            .push(ParseWarning::OcrBackendWarning);
+    }
     pr
 }
 
@@ -397,7 +473,12 @@ async fn dispatch_inner(
             tracing::info!("PaddleOCR mode=primary, trying Paddle before pdf_oxide");
             match crate::services::paddle_ocr::parse_pdf(&bytes_for_ocr, cfg).await {
                 Ok(result) if !result.markdown.trim().is_empty() => {
-                    return Ok(finalize_ocr_result(result, None, RoutedTo::Paddle));
+                    return Ok(finalize_ocr_result(
+                        result,
+                        None,
+                        RoutedTo::Paddle,
+                        Vec::new(),
+                    ));
                 }
                 Ok(_) => {
                     tracing::warn!("PaddleOCR returned empty result, falling back to pdf_oxide");
@@ -442,6 +523,7 @@ async fn dispatch_inner(
                 match report.class {
                     PdfClass::TextSimple => {
                         result.document.metadata.routed_to = Some(RoutedTo::PdfOxide);
+                        maybe_warn_low_text(&mut result);
                         return Ok(result);
                     }
                     PdfClass::TextStructured => {
@@ -456,11 +538,19 @@ async fn dispatch_inner(
                                         pr,
                                         Some(summary),
                                         RoutedTo::Paddle,
+                                        Vec::new(),
                                     ));
                                 }
-                                Ok(_) => tracing::warn!(
-                                    "PaddleOCR empty on structured doc, keeping pdf_oxide"
-                                ),
+                                Ok(_) => {
+                                    tracing::warn!(
+                                        "PaddleOCR empty on structured doc, keeping pdf_oxide"
+                                    );
+                                    result
+                                        .document
+                                        .metadata
+                                        .warnings
+                                        .push(ParseWarning::PaddleReturnedEmpty);
+                                }
                                 Err(e) => tracing::warn!(
                                     error = %e,
                                     "PaddleOCR failed on structured doc, keeping pdf_oxide"
@@ -468,6 +558,7 @@ async fn dispatch_inner(
                             }
                         }
                         result.document.metadata.routed_to = Some(RoutedTo::PdfOxide);
+                        maybe_warn_low_text(&mut result);
                         return Ok(result);
                     }
                     PdfClass::ScannedOrEmpty => {
@@ -479,6 +570,7 @@ async fn dispatch_inner(
                                 outcome.result,
                                 Some(summary),
                                 outcome.backend,
+                                outcome.warnings,
                             ));
                         }
                         // All OCR backends failed — fall through to the
@@ -486,6 +578,7 @@ async fn dispatch_inner(
                         // caller will see empty text but at least gets a
                         // shaped response.
                         result.document.metadata.routed_to = Some(RoutedTo::PdfOxide);
+                        maybe_warn_low_text(&mut result);
                         return Ok(result);
                     }
                     PdfClass::Unknown => {
@@ -508,10 +601,12 @@ async fn dispatch_inner(
                         outcome.result,
                         classification,
                         outcome.backend,
+                        outcome.warnings,
                     ));
                 }
             }
             result.document.metadata.routed_to = Some(RoutedTo::PdfOxide);
+            maybe_warn_low_text(&mut result);
             Ok(result)
         }
         Err(err) if is_ocr_recoverable(&err) => {
@@ -521,7 +616,12 @@ async fn dispatch_inner(
                  (classification skipped — no first-pass result to classify)"
             );
             match run_ocr_backends(&bytes_for_ocr, &ocr_cfg, paddle_cfg.as_ref()).await {
-                Some(outcome) => Ok(finalize_ocr_result(outcome.result, None, outcome.backend)),
+                Some(outcome) => Ok(finalize_ocr_result(
+                    outcome.result,
+                    None,
+                    outcome.backend,
+                    outcome.warnings,
+                )),
                 None => Err(AppError::PdfProcessing(
                     "All OCR backends failed to parse the document".into(),
                 )),
@@ -541,8 +641,14 @@ async fn run_ocr_backends(
     tesseract_cfg: &ocr::OcrConfig,
     paddle_cfg: Option<&crate::services::paddle_ocr::PaddleOcrConfig>,
 ) -> Option<OcrBackendOutcome> {
+    // Track whether we had to degrade off Paddle. If so, the eventual
+    // Tesseract success is reported with `PaddleDegradedToTesseract`
+    // so the caller knows the chain compromised on quality.
+    let mut paddle_was_attempted = false;
+
     // Try PaddleOCR first when configured
     if let Some(cfg) = paddle_cfg {
+        paddle_was_attempted = true;
         tracing::info!(url = %cfg.base_url, "Trying PaddleOCR PP-StructureV3");
         match crate::services::paddle_ocr::parse_pdf(bytes, cfg).await {
             Ok(result) if !result.markdown.trim().is_empty() => {
@@ -554,6 +660,7 @@ async fn run_ocr_backends(
                 return Some(OcrBackendOutcome {
                     result,
                     backend: RoutedTo::Paddle,
+                    warnings: Vec::new(),
                 });
             }
             Ok(_) => {
@@ -569,10 +676,16 @@ async fn run_ocr_backends(
     // through the deref so no Vec materialization is needed.
     let bytes_for_tess: PdfBytes = Arc::clone(bytes);
     let cfg = tesseract_cfg.clone();
+    let degradation_warnings = if paddle_was_attempted {
+        vec![ParseWarning::PaddleDegradedToTesseract]
+    } else {
+        Vec::new()
+    };
     match tokio::task::spawn_blocking(move || ocr::ocr_pdf(&bytes_for_tess, &cfg)).await {
         Ok(Ok(result)) if !result.text.is_empty() => Some(OcrBackendOutcome {
             result,
             backend: RoutedTo::Tesseract,
+            warnings: degradation_warnings,
         }),
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "Tesseract OCR failed");
@@ -640,6 +753,7 @@ fn build_result_from_ocr(ocr_result: ocr::OcrResult) -> ParseResult {
                 processing_ms: ocr_result.processing_ms,
                 classification: None,
                 routed_to: None,
+                warnings: Vec::new(),
             },
         },
         usage: UsageInfo {
@@ -1484,6 +1598,94 @@ mod tests {
         assert!(
             matches!(err, AppError::EncryptedPdf),
             "expected EncryptedPdf, got {err:?}"
+        );
+    }
+
+    // ── Structured tables from OCR backends ─────────────────────────────
+
+    #[test]
+    fn paddle_markdown_with_pipe_table_promotes_to_structured_tables() {
+        // PaddleOCR PP-StructureV3 emits GFM pipe tables in its markdown
+        // output. The dispatcher feeds that markdown into
+        // `extract_tables_from_markdown`, which already lifts pipe-tables
+        // into the typed `tables` field. This test pins that contract so
+        // a future markdown change can't silently strip Paddle's tables.
+        let md = "## Page 1\n\n\
+                  | Item | Qty | Price |\n\
+                  |------|-----|-------|\n\
+                  | A    | 2   | $10   |\n\
+                  | B    | 1   | $20   |\n";
+        let ocr_result = ocr::OcrResult {
+            text: "Item Qty Price A 2 $10 B 1 $20".into(),
+            markdown: md.into(),
+            pages: vec![ocr::OcrPageResult {
+                page_number: 1,
+                text: "Item Qty Price A 2 $10 B 1 $20".into(),
+            }],
+            processing_ms: 100,
+            warning: None,
+        };
+        let pr = build_result_from_ocr(ocr_result);
+        assert_eq!(
+            pr.document.tables.len(),
+            1,
+            "Paddle markdown table must promote to structured tables; got {:?}",
+            pr.document.tables
+        );
+        assert_eq!(pr.document.tables[0].headers, vec!["Item", "Qty", "Price"]);
+        assert_eq!(pr.document.tables[0].rows.len(), 2);
+    }
+
+    // ── Backend degradation warnings ────────────────────────────────────
+
+    #[test]
+    fn warning_serializes_as_snake_case_string() {
+        let w = ParseWarning::PaddleDegradedToTesseract;
+        let s = serde_json::to_string(&w).unwrap();
+        assert_eq!(s, "\"paddle_degraded_to_tesseract\"");
+    }
+
+    #[test]
+    fn document_metadata_omits_warnings_when_empty() {
+        let bytes = include_bytes!("../../tests/fixtures/sample.pdf").to_vec();
+        let result = parse_pdf(&bytes, "pdftoppm").unwrap();
+        let json = serde_json::to_value(&result.document.metadata).unwrap();
+        assert!(
+            json.get("warnings").is_none(),
+            "warnings field must be skipped when empty; got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paddle_failure_records_degradation_warning_when_tesseract_recovers() {
+        // Configure a Paddle URL that won't resolve so the call errors
+        // out, then run a scanned doc that needs OCR. Tesseract should
+        // recover and the metadata should record the degradation.
+        let config = ocr::OcrConfig::default();
+        let bad_paddle = crate::services::paddle_ocr::PaddleOcrConfig::new(
+            String::from("http://127.0.0.1:1"), // unroutable
+            1,
+        );
+        let bytes = include_bytes!("../../tests/fixtures/scanned_form.pdf").to_vec();
+        let result = parse_pdf_with_backends_mode(
+            std::sync::Arc::<[u8]>::from(bytes),
+            &config,
+            Some(&bad_paddle),
+            crate::config::PaddleOcrMode::Fallback,
+            None,
+            std::time::Duration::from_secs(90),
+        )
+        .await
+        .expect("tesseract must still recover this scanned doc");
+        assert_eq!(result.document.metadata.routed_to, Some(RoutedTo::Tesseract));
+        assert!(
+            result
+                .document
+                .metadata
+                .warnings
+                .contains(&ParseWarning::PaddleDegradedToTesseract),
+            "expected paddle_degraded_to_tesseract warning, got {:?}",
+            result.document.metadata.warnings
         );
     }
 

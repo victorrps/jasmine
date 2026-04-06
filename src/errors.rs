@@ -76,6 +76,18 @@ pub enum AppError {
     /// PDF is password-protected. We do not attempt to crack or guess.
     #[error("PDF is encrypted")]
     EncryptedPdf,
+
+    /// `/v1/extract`: the model returned data that does not validate
+    /// against the customer-supplied JSON Schema. Returning the data
+    /// anyway would be a worse customer surprise than failing loudly.
+    #[error("Extracted data did not validate against schema: {0}")]
+    SchemaValidationFailed(String),
+
+    /// `/v1/extract`: the document markdown exceeded the configured
+    /// `extract_max_input_chars` ceiling. Customers tune this to bound
+    /// per-call Anthropic spend.
+    #[error("Extract input too large: {actual} chars (limit {limit})")]
+    ExtractInputTooLarge { actual: usize, limit: usize },
 }
 
 impl AppError {
@@ -99,6 +111,8 @@ impl AppError {
             Self::DeadlineExceeded => "DEADLINE_EXCEEDED",
             Self::ServiceBusy => "SERVICE_BUSY",
             Self::EncryptedPdf => "ENCRYPTED_PDF",
+            Self::SchemaValidationFailed(_) => "SCHEMA_VALIDATION_FAILED",
+            Self::ExtractInputTooLarge { .. } => "EXTRACT_INPUT_TOO_LARGE",
         }
     }
 
@@ -121,6 +135,8 @@ impl AppError {
             Self::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
             Self::ServiceBusy => StatusCode::SERVICE_UNAVAILABLE,
             Self::EncryptedPdf => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::SchemaValidationFailed(_) => StatusCode::BAD_GATEWAY,
+            Self::ExtractInputTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 
@@ -129,6 +145,12 @@ impl AppError {
         match self {
             Self::Database(_) | Self::Internal(_) => "An internal error occurred".into(),
             Self::QuotaExceeded(msg) => msg.clone(),
+            Self::SchemaValidationFailed(detail) => {
+                format!("Extracted data did not validate against schema: {detail}")
+            }
+            Self::ExtractInputTooLarge { actual, limit } => {
+                format!("Extract input too large: {actual} chars (limit {limit})")
+            }
             other => other.to_string(),
         }
     }
@@ -260,6 +282,24 @@ mod tests {
         let err = AppError::EncryptedPdf;
         assert_eq!(err.code(), "ENCRYPTED_PDF");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn schema_validation_failed_maps_to_502() {
+        let err = AppError::SchemaValidationFailed("path /foo: required".into());
+        assert_eq!(err.code(), "SCHEMA_VALIDATION_FAILED");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            err.safe_message().contains("path /foo"),
+            "validation detail must be forwarded to caller"
+        );
+    }
+
+    #[test]
+    fn extract_input_too_large_maps_to_413() {
+        let err = AppError::ExtractInputTooLarge { actual: 100, limit: 80 };
+        assert_eq!(err.code(), "EXTRACT_INPUT_TOO_LARGE");
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

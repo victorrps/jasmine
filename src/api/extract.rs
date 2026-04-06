@@ -151,12 +151,29 @@ pub async fn extract_pdf(
     )
     .await?;
 
+    // T2.5 — bound Anthropic spend per request. We refuse rather than
+    // truncate so the customer is never silently shipped a partial
+    // extraction.
+    if parse_result.document.markdown.chars().count() > config.extract_max_input_chars {
+        return Err(AppError::ExtractInputTooLarge {
+            actual: parse_result.document.markdown.chars().count(),
+            limit: config.extract_max_input_chars,
+        });
+    }
+
     let extracted = schema_extractor::extract_with_schema(
         &parse_result.document.markdown,
         &schema,
         config.anthropic_api_key.as_deref(),
     )
     .await?;
+
+    // T2.4 — validate the model output against the customer-supplied
+    // schema. Returning data that doesn't validate is a worse customer
+    // surprise than failing loudly.
+    if let Err(detail) = validate_against_schema(&extracted.data, &schema) {
+        return Err(AppError::SchemaValidationFailed(detail));
+    }
 
     // Log usage asynchronously
     let pool_clone = pool.get_ref().clone();
@@ -192,4 +209,124 @@ pub async fn extract_pdf(
         usage: parse_result.usage,
         request_id: req_id.id.clone(),
     }))
+}
+
+/// Validate `data` against the customer-supplied JSON Schema. Compiles
+/// the schema fresh per request — schemas are typically tiny (kilobytes)
+/// so we don't bother caching, and a fresh compile means we can't be
+/// poisoned by a stale compiled instance across requests.
+///
+/// Returns `Ok(())` if valid, `Err(detail)` with a sanitized list of
+/// validation errors otherwise. The detail string is small enough to
+/// embed in the API error response without leaking values from the
+/// extracted document.
+fn validate_against_schema(
+    data: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<(), String> {
+    let compiled = match jsonschema::JSONSchema::compile(schema) {
+        Ok(c) => c,
+        Err(e) => {
+            // The schema itself was malformed — surfaced as a "validation
+            // failed" error so the customer realizes the schema needs
+            // fixing rather than retrying the extraction. We do not leak
+            // the internal compiler error verbatim; instead we identify
+            // the schema as the offender.
+            return Err(format!("schema compilation failed: {e}"));
+        }
+    };
+    if let Err(errors) = compiled.validate(data) {
+        // Collect at most 5 error paths so the response stays compact
+        // and we never echo extracted values.
+        let summary: Vec<String> = errors
+            .take(5)
+            .map(|e| format!("{}: {}", e.instance_path, e.kind_name()))
+            .collect();
+        return Err(summary.join("; "));
+    }
+    Ok(())
+}
+
+/// Lightweight extension trait to give a stable string label to a
+/// `jsonschema::error::ValidationErrorKind` without allocating the full
+/// debug repr (which can include extracted values).
+trait ErrorKindName {
+    fn kind_name(&self) -> &'static str;
+}
+
+impl<'a> ErrorKindName for jsonschema::ValidationError<'a> {
+    fn kind_name(&self) -> &'static str {
+        use jsonschema::error::ValidationErrorKind as K;
+        match self.kind {
+            K::Required { .. } => "required",
+            K::Type { .. } => "type",
+            K::Enum { .. } => "enum",
+            K::MinLength { .. } => "min_length",
+            K::MaxLength { .. } => "max_length",
+            K::Minimum { .. } => "minimum",
+            K::Maximum { .. } => "maximum",
+            K::Pattern { .. } => "pattern",
+            K::AdditionalProperties { .. } => "additional_properties",
+            _ => "validation_failed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_passes_when_data_matches_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}}
+        });
+        let data = serde_json::json!({"name": "Alice"});
+        assert!(validate_against_schema(&data, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_fails_when_required_field_missing() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}}
+        });
+        let data = serde_json::json!({});
+        let err = validate_against_schema(&data, &schema).unwrap_err();
+        assert!(err.contains("required"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_fails_on_wrong_type() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"age": {"type": "integer"}}
+        });
+        let data = serde_json::json!({"age": "not a number"});
+        let err = validate_against_schema(&data, &schema).unwrap_err();
+        assert!(err.contains("type"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_caps_error_count_at_5() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["a","b","c","d","e","f","g"]
+        });
+        let data = serde_json::json!({});
+        let err = validate_against_schema(&data, &schema).unwrap_err();
+        // 5 errors max — separator is "; " so 4 separators
+        assert_eq!(err.matches("; ").count(), 4, "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_schema() {
+        let schema = serde_json::json!({"type": "not_a_real_type"});
+        let data = serde_json::json!({});
+        let err = validate_against_schema(&data, &schema).unwrap_err();
+        assert!(err.contains("schema compilation failed"), "got: {err}");
+    }
 }

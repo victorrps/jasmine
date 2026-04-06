@@ -53,6 +53,7 @@ async fn parse_endpoint_uses_live_paddle_sidecar() {
         paddleocr_mode: docforge::config::PaddleOcrMode::Primary,
             max_concurrent_parses: 8,
             parse_deadline_secs: 90,
+            extract_max_input_chars: 200_000,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
