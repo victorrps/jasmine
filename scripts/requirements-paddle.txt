@@ -1,0 +1,7 @@
+# PaddleOCR PP-StructureV3 sidecar deps.
+# paddlepaddle is installed separately via the PaddlePaddle index — see
+# scripts/setup_paddle.sh.
+paddleocr[doc-parser]>=3.0,<4.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5

@@ -1,0 +1,376 @@
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+/// Application configuration loaded from environment variables.
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub host: String,
+    pub port: u16,
+    pub database_url: String,
+    pub jwt_secret: String,
+    pub jwt_expiry_minutes: u64,
+    pub rate_limit_per_minute: u64,
+    /// Server-side HMAC key for API key hashing. Prevents offline brute-force if DB is leaked.
+    pub api_key_pepper: String,
+    /// Anthropic API key for Claude Haiku schema extraction. Optional — falls back to stub.
+    pub anthropic_api_key: Option<String>,
+    /// Stripe secret key for metered billing. Optional — billing features disabled without it.
+    #[allow(dead_code)]
+    pub stripe_secret_key: Option<String>,
+    /// Stripe webhook signing secret. Optional — signature verification skipped without it.
+    pub stripe_webhook_secret: Option<String>,
+    /// Path to tesseract binary for local OCR. Defaults to "tesseract" (found via PATH).
+    pub tesseract_path: String,
+    /// Path to pdftoppm binary for PDF-to-image conversion. Defaults to "pdftoppm" (found via PATH).
+    pub pdftoppm_path: String,
+    /// PaddleOCR serving URL (e.g. http://localhost:8868). When set, PaddleOCR PP-StructureV3
+    /// is used as the primary OCR/layout engine with tesseract as fallback.
+    pub paddleocr_url: Option<String>,
+    /// Timeout in seconds for PaddleOCR HTTP calls. Defaults to 120s (layout parsing is slow).
+    pub paddleocr_timeout_secs: u64,
+}
+
+impl AppConfig {
+    /// Load configuration from environment variables.
+    /// Fails fast if any required variable is missing or invalid.
+    pub fn from_env() -> Result<Self> {
+        dotenvy::dotenv().ok();
+
+        let vars: HashMap<String, String> = std::env::vars().collect();
+        Self::from_vars(&vars)
+    }
+
+    /// Build configuration from an explicit variable map.
+    /// Used directly in tests to avoid global environment mutation.
+    pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self> {
+        let get = |key: &str| -> Option<String> { vars.get(key).cloned() };
+
+        let jwt_secret = get("JWT_SECRET").with_context(|| "JWT_SECRET must be set")?;
+        if jwt_secret.len() < 32 {
+            anyhow::bail!("JWT_SECRET must be at least 32 characters");
+        }
+
+        let port_str = get("PORT").unwrap_or_else(|| "8080".into());
+        let port: u16 = port_str.parse().context("PORT must be a valid u16")?;
+
+        let database_url = get("DATABASE_URL").with_context(|| "DATABASE_URL must be set")?;
+
+        let jwt_expiry_minutes: u64 = get("JWT_EXPIRY_MINUTES")
+            .unwrap_or_else(|| "15".into())
+            .parse()
+            .context("JWT_EXPIRY_MINUTES must be a valid u64")?;
+
+        let rate_limit_per_minute: u64 = get("RATE_LIMIT_PER_MINUTE")
+            .unwrap_or_else(|| "60".into())
+            .parse()
+            .context("RATE_LIMIT_PER_MINUTE must be a valid u64")?;
+
+        let api_key_pepper =
+            get("API_KEY_PEPPER").with_context(|| "API_KEY_PEPPER must be set")?;
+        if api_key_pepper.len() < 32 {
+            anyhow::bail!("API_KEY_PEPPER must be at least 32 characters");
+        }
+
+        let anthropic_api_key = get("ANTHROPIC_API_KEY").filter(|k| !k.is_empty());
+        let stripe_secret_key = get("STRIPE_SECRET_KEY").filter(|k| !k.is_empty());
+        let stripe_webhook_secret = get("STRIPE_WEBHOOK_SECRET").filter(|k| !k.is_empty());
+
+        let tesseract_path =
+            get("TESSERACT_PATH").unwrap_or_else(|| "tesseract".into());
+        let pdftoppm_path =
+            get("PDFTOPPM_PATH").unwrap_or_else(|| "pdftoppm".into());
+
+        let paddleocr_url = get("PADDLEOCR_URL")
+            .filter(|u| !u.is_empty())
+            .map(|u| u.trim_end_matches('/').to_string());
+        let paddleocr_timeout_secs: u64 = get("PADDLEOCR_TIMEOUT_SECS")
+            .unwrap_or_else(|| "120".into())
+            .parse()
+            .context("PADDLEOCR_TIMEOUT_SECS must be a valid u64")?;
+
+        Ok(Self {
+            host: get("HOST").unwrap_or_else(|| "127.0.0.1".into()),
+            port,
+            database_url,
+            jwt_secret,
+            jwt_expiry_minutes,
+            rate_limit_per_minute,
+            api_key_pepper,
+            anthropic_api_key,
+            stripe_secret_key,
+            stripe_webhook_secret,
+            tesseract_path,
+            pdftoppm_path,
+            paddleocr_url,
+            paddleocr_timeout_secs,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_SECRET: &str = "a_valid_secret_that_is_at_least_32_chars";
+    const VALID_PEPPER: &str = "a_valid_pepper_that_is_at_least_32_chars";
+    const VALID_DB: &str = "sqlite://:memory:";
+
+    /// Build a minimal valid vars map for `from_vars`.
+    fn base_vars() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("JWT_SECRET".into(), VALID_SECRET.into());
+        m.insert("API_KEY_PEPPER".into(), VALID_PEPPER.into());
+        m.insert("DATABASE_URL".into(), VALID_DB.into());
+        m
+    }
+
+    #[test]
+    fn from_vars_fails_when_pepper_missing() {
+        let mut vars = base_vars();
+        vars.remove("API_KEY_PEPPER");
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(err.contains("API_KEY_PEPPER"), "got: {err}");
+    }
+
+    #[test]
+    fn from_vars_fails_when_pepper_too_short() {
+        let mut vars = base_vars();
+        vars.insert("API_KEY_PEPPER".into(), "short".into());
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(err.contains("32"), "got: {err}");
+    }
+
+    #[test]
+    fn from_vars_succeeds_with_required_vars() {
+        let vars = base_vars();
+        let cfg = AppConfig::from_vars(&vars).expect("must succeed with required vars");
+        assert_eq!(cfg.jwt_secret, VALID_SECRET);
+        assert_eq!(cfg.database_url, VALID_DB);
+    }
+
+    #[test]
+    fn from_vars_uses_default_host_when_absent() {
+        let vars = base_vars();
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn from_vars_uses_custom_host_when_set() {
+        let mut vars = base_vars();
+        vars.insert("HOST".into(), "0.0.0.0".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn from_vars_uses_default_port_when_absent() {
+        let vars = base_vars();
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.port, 8080);
+    }
+
+    #[test]
+    fn from_vars_uses_custom_port_when_set() {
+        let mut vars = base_vars();
+        vars.insert("PORT".into(), "3000".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.port, 3000);
+    }
+
+    #[test]
+    fn from_vars_uses_default_jwt_expiry_when_absent() {
+        let vars = base_vars();
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.jwt_expiry_minutes, 15);
+    }
+
+    #[test]
+    fn from_vars_uses_custom_jwt_expiry() {
+        let mut vars = base_vars();
+        vars.insert("JWT_EXPIRY_MINUTES".into(), "60".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.jwt_expiry_minutes, 60);
+    }
+
+    #[test]
+    fn from_vars_uses_default_rate_limit_when_absent() {
+        let vars = base_vars();
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.rate_limit_per_minute, 60);
+    }
+
+    #[test]
+    fn from_vars_uses_custom_rate_limit() {
+        let mut vars = base_vars();
+        vars.insert("RATE_LIMIT_PER_MINUTE".into(), "120".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn from_vars_fails_when_jwt_secret_missing() {
+        let mut vars = base_vars();
+        vars.remove("JWT_SECRET");
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("JWT_SECRET"),
+            "error should mention JWT_SECRET, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_vars_fails_when_jwt_secret_too_short() {
+        let mut vars = base_vars();
+        vars.insert("JWT_SECRET".into(), "tooshort".into());
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("32"),
+            "error should mention 32 chars, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_vars_jwt_secret_exactly_32_chars_is_valid() {
+        let secret = "12345678901234567890123456789012"; // exactly 32 chars
+        assert_eq!(secret.len(), 32);
+        let mut vars = base_vars();
+        vars.insert("JWT_SECRET".into(), secret.into());
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_ok(), "32-char secret must be accepted");
+    }
+
+    #[test]
+    fn from_vars_fails_when_database_url_missing() {
+        let mut vars = base_vars();
+        vars.remove("DATABASE_URL");
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("DATABASE_URL"),
+            "error should mention DATABASE_URL, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_vars_fails_on_invalid_port() {
+        let mut vars = base_vars();
+        vars.insert("PORT".into(), "not_a_number".into());
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("PORT"),
+            "error should mention PORT, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_vars_fails_on_port_out_of_u16_range() {
+        let mut vars = base_vars();
+        vars.insert("PORT".into(), "99999".into());
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err(), "port 99999 must fail u16 range check");
+    }
+
+    #[test]
+    fn from_vars_accepts_port_boundary_values() {
+        let mut vars = base_vars();
+        vars.insert("PORT".into(), "1".into());
+        assert!(AppConfig::from_vars(&vars).is_ok(), "port 1 must be valid");
+
+        vars.insert("PORT".into(), "65535".into());
+        assert!(
+            AppConfig::from_vars(&vars).is_ok(),
+            "port 65535 must be valid"
+        );
+    }
+
+    #[test]
+    fn from_vars_fails_on_invalid_jwt_expiry_minutes() {
+        let mut vars = base_vars();
+        vars.insert("JWT_EXPIRY_MINUTES".into(), "abc".into());
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("JWT_EXPIRY_MINUTES"));
+    }
+
+    #[test]
+    fn from_vars_fails_on_invalid_rate_limit() {
+        let mut vars = base_vars();
+        vars.insert("RATE_LIMIT_PER_MINUTE".into(), "abc".into());
+        let result = AppConfig::from_vars(&vars);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("RATE_LIMIT_PER_MINUTE"));
+    }
+
+    // ── anthropic_api_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_api_key_is_none_when_var_absent() {
+        let vars = base_vars(); // no ANTHROPIC_API_KEY entry
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert!(
+            cfg.anthropic_api_key.is_none(),
+            "missing ANTHROPIC_API_KEY must produce None"
+        );
+    }
+
+    #[test]
+    fn anthropic_api_key_is_none_when_var_is_empty_string() {
+        let mut vars = base_vars();
+        vars.insert("ANTHROPIC_API_KEY".into(), "".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert!(
+            cfg.anthropic_api_key.is_none(),
+            "empty ANTHROPIC_API_KEY must produce None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn anthropic_api_key_is_some_when_var_is_valid_key() {
+        let mut vars = base_vars();
+        vars.insert("ANTHROPIC_API_KEY".into(), "sk-ant-api03-testkey123".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(
+            cfg.anthropic_api_key.as_deref(),
+            Some("sk-ant-api03-testkey123"),
+            "valid ANTHROPIC_API_KEY must be stored as Some"
+        );
+    }
+
+    #[test]
+    fn anthropic_api_key_preserves_key_value_exactly() {
+        let key = "sk-ant-api03-abcdefghijklmnop";
+        let mut vars = base_vars();
+        vars.insert("ANTHROPIC_API_KEY".into(), key.into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.anthropic_api_key.as_deref(), Some(key));
+    }
+
+    #[test]
+    fn anthropic_api_key_whitespace_only_is_treated_as_non_empty() {
+        // The filter only checks `is_empty()`, not whitespace — document the actual behaviour.
+        // A key of "   " is unusual but not our concern to reject here (that's the API's job).
+        let mut vars = base_vars();
+        vars.insert("ANTHROPIC_API_KEY".into(), "   ".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        // "   " is non-empty, so it should be Some("   ")
+        assert_eq!(
+            cfg.anthropic_api_key.as_deref(),
+            Some("   "),
+            "whitespace-only key is non-empty and must be preserved as Some"
+        );
+    }
+}

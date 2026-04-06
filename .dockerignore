@@ -1,0 +1,14 @@
+target/
+.git/
+.gitignore
+.env
+.env.docker
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+README.md
+business_docs/
+tests/
+scripts/
+.claude/

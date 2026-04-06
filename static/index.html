@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DocForge - Extract structured data from any PDF</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f172a;--bg-card:#1e293b;--bg-code:#0d1117;--text:#e2e8f0;--text-muted:#94a3b8;--accent:#3b82f6;--accent-hover:#2563eb;--border:#334155;--green:#22c55e;--orange:#f59e0b;--purple:#a78bfa}
+html{scroll-behavior:smooth}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,sans-serif;background:var(--bg);color:var(--text);line-height:1.6}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* Layout */
+.container{max-width:1120px;margin:0 auto;padding:0 24px}
+
+/* Nav */
+nav{position:sticky;top:0;z-index:50;background:rgba(15,23,42,0.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:16px 0}
+nav .container{display:flex;align-items:center;justify-content:space-between}
+nav .logo{font-size:1.25rem;font-weight:700;color:var(--text);letter-spacing:-0.02em}
+nav .logo span{color:var(--accent)}
+nav .links{display:flex;gap:24px;align-items:center}
+nav .links a{color:var(--text-muted);font-size:0.875rem;font-weight:500}
+nav .links a:hover{color:var(--text);text-decoration:none}
+.btn{display:inline-block;padding:8px 20px;border-radius:8px;font-size:0.875rem;font-weight:600;transition:background 0.2s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover);text-decoration:none}
+
+/* Hero */
+.hero{padding:100px 0 80px;text-align:center}
+.hero h1{font-size:3.5rem;font-weight:800;letter-spacing:-0.03em;line-height:1.1;margin-bottom:20px}
+.hero h1 span{background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero p{font-size:1.25rem;color:var(--text-muted);max-width:600px;margin:0 auto 40px}
+.hero-actions{display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
+.btn-outline{border:1px solid var(--border);color:var(--text);padding:8px 20px;border-radius:8px;font-size:0.875rem;font-weight:600;transition:border-color 0.2s}
+.btn-outline:hover{border-color:var(--accent);text-decoration:none}
+
+/* Features */
+.features{padding:80px 0}
+.section-title{text-align:center;font-size:2rem;font-weight:700;margin-bottom:12px}
+.section-subtitle{text-align:center;color:var(--text-muted);margin-bottom:48px;font-size:1.05rem}
+.features-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px}
+.feature-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:32px;transition:border-color 0.2s}
+.feature-card:hover{border-color:var(--accent)}
+.feature-icon{width:48px;height:48px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.5rem;margin-bottom:16px}
+.feature-card:nth-child(1) .feature-icon{background:rgba(59,130,246,0.15);color:var(--accent)}
+.feature-card:nth-child(2) .feature-icon{background:rgba(167,139,250,0.15);color:var(--purple)}
+.feature-card:nth-child(3) .feature-icon{background:rgba(34,197,94,0.15);color:var(--green)}
+.feature-card h3{font-size:1.15rem;font-weight:600;margin-bottom:8px}
+.feature-card p{color:var(--text-muted);font-size:0.925rem}
+
+/* Code Example */
+.code-section{padding:80px 0}
+.code-block{background:var(--bg-code);border:1px solid var(--border);border-radius:12px;overflow:hidden;max-width:720px;margin:0 auto}
+.code-header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--border);background:rgba(255,255,255,0.03)}
+.code-dot{width:12px;height:12px;border-radius:50%}
+.code-dot:nth-child(1){background:#ef4444}
+.code-dot:nth-child(2){background:#f59e0b}
+.code-dot:nth-child(3){background:#22c55e}
+.code-header span{margin-left:8px;color:var(--text-muted);font-size:0.8rem;font-family:'SF Mono',Monaco,Consolas,'Courier New',monospace}
+.code-body{padding:20px;overflow-x:auto}
+.code-body pre{font-family:'SF Mono',Monaco,Consolas,'Courier New',monospace;font-size:0.85rem;line-height:1.7;color:var(--text)}
+.code-body .comment{color:#6b7280}
+.code-body .string{color:#22c55e}
+.code-body .flag{color:#f59e0b}
+.code-body .url{color:var(--accent)}
+.code-body .cmd{color:var(--purple)}
+
+/* Pricing */
+.pricing{padding:80px 0}
+.pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px}
+.pricing-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:32px 24px;text-align:center;position:relative;transition:border-color 0.2s}
+.pricing-card:hover{border-color:var(--accent)}
+.pricing-card.popular{border-color:var(--accent)}
+.pricing-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:0.75rem;font-weight:600;padding:4px 14px;border-radius:20px}
+.pricing-card h3{font-size:1.05rem;font-weight:600;margin-bottom:4px}
+.pricing-card .price{font-size:2.5rem;font-weight:800;margin:12px 0 4px}
+.pricing-card .price span{font-size:1rem;font-weight:400;color:var(--text-muted)}
+.pricing-card .limit{color:var(--text-muted);font-size:0.875rem;margin-bottom:24px}
+.pricing-card ul{list-style:none;text-align:left;margin-bottom:24px}
+.pricing-card li{padding:6px 0;font-size:0.875rem;color:var(--text-muted)}
+.pricing-card li::before{content:"\2713";color:var(--green);margin-right:8px;font-weight:700}
+.pricing-card .btn{width:100%}
+
+/* Footer */
+footer{border-top:1px solid var(--border);padding:40px 0;text-align:center}
+footer p{color:var(--text-muted);font-size:0.875rem}
+footer .footer-links{display:flex;gap:24px;justify-content:center;margin-bottom:12px}
+footer .footer-links a{color:var(--text-muted);font-size:0.875rem}
+
+/* Responsive */
+@media(max-width:640px){
+  .hero h1{font-size:2.25rem}
+  .hero p{font-size:1.05rem}
+  .pricing-grid{grid-template-columns:1fr}
+  nav .links{gap:12px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <div class="logo">Doc<span>Forge</span></div>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="docs.html">Docs</a>
+      <a href="#quickstart">Quick Start</a>
+      <a href="docs.html" class="btn btn-primary">Get API Key</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <h1>Extract structured data<br>from <span>any PDF</span></h1>
+    <p>API-first, LLM-ready. Parse PDFs into clean markdown, extract fields with AI, and integrate via Model Context Protocol.</p>
+    <div class="hero-actions">
+      <a href="docs.html" class="btn btn-primary">Read the Docs</a>
+      <a href="#quickstart" class="btn btn-outline">Quick Start</a>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <div class="container">
+    <h2 class="section-title">Built for developers</h2>
+    <p class="section-subtitle">Three ways to get structured data out of PDFs</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">&#128196;</div>
+        <h3>PDF Parsing</h3>
+        <p>Upload any PDF and get structured markdown, tables, and metadata back. Handles multi-page documents, scanned pages, and complex layouts.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128270;</div>
+        <h3>Schema Extraction</h3>
+        <p>Define a JSON schema and let Claude AI extract matching fields from your PDF. Invoices, contracts, receipts &mdash; any document type.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#9889;</div>
+        <h3>MCP Server</h3>
+        <p>Native Model Context Protocol server for AI agent integration. Connect Claude, Cursor, or any MCP-compatible client directly.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="code-section" id="quickstart">
+  <div class="container">
+    <h2 class="section-title">Up and running in seconds</h2>
+    <p class="section-subtitle">One curl command to parse your first PDF</p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dot"></div>
+        <div class="code-dot"></div>
+        <div class="code-dot"></div>
+        <span>terminal</span>
+      </div>
+      <div class="code-body">
+<pre><span class="comment"># Parse a PDF into structured markdown</span>
+<span class="cmd">curl</span> <span class="flag">-X POST</span> <span class="url">http://localhost:8080/v1/parse</span> \
+  <span class="flag">-H</span> <span class="string">"X-API-Key: your_api_key"</span> \
+  <span class="flag">-F</span> <span class="string">"file=@invoice.pdf"</span>
+
+<span class="comment"># Response</span>
+{
+  <span class="string">"markdown"</span>: <span class="string">"# Invoice #1042\n\n| Item | Qty | Price |..."</span>,
+  <span class="string">"page_count"</span>: 3,
+  <span class="string">"metadata"</span>: { <span class="string">"title"</span>: <span class="string">"Invoice"</span>, ... }
+}
+
+<span class="comment"># Extract fields with a JSON schema</span>
+<span class="cmd">curl</span> <span class="flag">-X POST</span> <span class="url">http://localhost:8080/v1/extract</span> \
+  <span class="flag">-H</span> <span class="string">"X-API-Key: your_api_key"</span> \
+  <span class="flag">-F</span> <span class="string">"file=@invoice.pdf"</span> \
+  <span class="flag">-F</span> <span class="string">'schema={"vendor":"string","total":"number"}'</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="pricing" id="pricing">
+  <div class="container">
+    <h2 class="section-title">Simple, transparent pricing</h2>
+    <p class="section-subtitle">Pay only for what you use. All plans include every feature.</p>
+    <div class="pricing-grid">
+
+      <div class="pricing-card">
+        <h3>Free</h3>
+        <div class="price">$0<span>/mo</span></div>
+        <div class="limit">50 pages / month</div>
+        <ul>
+          <li>PDF parsing + markdown</li>
+          <li>Schema extraction</li>
+          <li>MCP server access</li>
+          <li>Community support</li>
+        </ul>
+        <a href="docs.html#auth" class="btn btn-outline">Get Started</a>
+      </div>
+
+      <div class="pricing-card">
+        <h3>Starter</h3>
+        <div class="price">$9<span>/mo</span></div>
+        <div class="limit">1,000 pages / month</div>
+        <ul>
+          <li>Everything in Free</li>
+          <li>Higher rate limits</li>
+          <li>Email support</li>
+          <li>Usage dashboard</li>
+        </ul>
+        <a href="docs.html#auth" class="btn btn-outline">Get Started</a>
+      </div>
+
+      <div class="pricing-card popular">
+        <div class="pricing-badge">Popular</div>
+        <h3>Pro</h3>
+        <div class="price">$29<span>/mo</span></div>
+        <div class="limit">5,000 pages / month</div>
+        <ul>
+          <li>Everything in Starter</li>
+          <li>Priority processing</li>
+          <li>Webhook notifications</li>
+          <li>Priority support</li>
+        </ul>
+        <a href="docs.html#auth" class="btn btn-primary">Get Started</a>
+      </div>
+
+      <div class="pricing-card">
+        <h3>Enterprise</h3>
+        <div class="price">$79<span>/mo</span></div>
+        <div class="limit">25,000 pages / month</div>
+        <ul>
+          <li>Everything in Pro</li>
+          <li>Dedicated infrastructure</li>
+          <li>Custom SLA</li>
+          <li>Dedicated support</li>
+        </ul>
+        <a href="docs.html#auth" class="btn btn-outline">Get Started</a>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="docs.html">API Docs</a>
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="https://github.com">GitHub</a>
+    </div>
+    <p>Built with Rust + Actix Web. &copy; 2026 DocForge.</p>
+  </div>
+</footer>
+
+</body>
+</html>

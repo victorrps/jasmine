@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DocForge - API Documentation</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f172a;--bg-card:#1e293b;--bg-code:#0d1117;--text:#e2e8f0;--text-muted:#94a3b8;--accent:#3b82f6;--accent-hover:#2563eb;--border:#334155;--green:#22c55e;--orange:#f59e0b;--purple:#a78bfa;--red:#ef4444}
+html{scroll-behavior:smooth}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,sans-serif;background:var(--bg);color:var(--text);line-height:1.7}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* Layout */
+.page{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+@media(max-width:768px){.page{grid-template-columns:1fr}.sidebar{display:none}}
+
+/* Sidebar */
+.sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;border-right:1px solid var(--border);padding:24px 16px;background:rgba(15,23,42,0.6)}
+.sidebar .logo{font-size:1.15rem;font-weight:700;margin-bottom:24px;color:var(--text)}
+.sidebar .logo span{color:var(--accent)}
+.sidebar nav a{display:block;padding:6px 12px;margin:2px 0;border-radius:6px;font-size:0.85rem;color:var(--text-muted);transition:background 0.15s}
+.sidebar nav a:hover{background:var(--bg-card);color:var(--text);text-decoration:none}
+.sidebar nav .section-label{font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);padding:16px 12px 4px;opacity:0.7}
+
+/* Main content */
+.content{padding:40px 48px;max-width:860px}
+@media(max-width:768px){.content{padding:24px 16px}}
+.content h1{font-size:2rem;font-weight:800;margin-bottom:8px;letter-spacing:-0.02em}
+.content h2{font-size:1.4rem;font-weight:700;margin:48px 0 16px;padding-top:24px;border-top:1px solid var(--border)}
+.content h3{font-size:1.1rem;font-weight:600;margin:32px 0 12px}
+.content p{color:var(--text-muted);margin-bottom:16px}
+.content ul,.content ol{color:var(--text-muted);margin:0 0 16px 20px}
+.content li{margin-bottom:6px}
+
+/* Method badges */
+.method{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:'SF Mono',Monaco,Consolas,monospace;margin-right:8px;vertical-align:middle}
+.method-get{background:rgba(34,197,94,0.15);color:var(--green)}
+.method-post{background:rgba(59,130,246,0.15);color:var(--accent)}
+.method-delete{background:rgba(239,68,68,0.15);color:var(--red)}
+
+/* Endpoint path */
+.endpoint-path{font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.9rem;color:var(--text)}
+
+/* Code blocks */
+pre{background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;margin-bottom:16px;font-family:'SF Mono',Monaco,Consolas,'Courier New',monospace;font-size:0.82rem;line-height:1.6;color:var(--text)}
+code{font-family:'SF Mono',Monaco,Consolas,'Courier New',monospace;font-size:0.85em;background:var(--bg-card);padding:2px 6px;border-radius:4px}
+pre code{background:none;padding:0}
+.comment{color:#6b7280}
+.string{color:var(--green)}
+.key{color:var(--accent)}
+.number{color:var(--orange)}
+
+/* Table */
+table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:0.875rem}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
+th{color:var(--text-muted);font-weight:600;font-size:0.8rem;text-transform:uppercase;letter-spacing:0.03em}
+td{color:var(--text)}
+
+/* Alert box */
+.alert{border-radius:8px;padding:14px 18px;margin-bottom:16px;font-size:0.875rem}
+.alert-info{background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.25);color:var(--accent)}
+.alert-warn{background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.25);color:var(--orange)}
+</style>
+</head>
+<body>
+
+<div class="page">
+<aside class="sidebar">
+  <div class="logo">Doc<span>Forge</span> <small style="font-weight:400;font-size:0.7rem;color:var(--text-muted)">API</small></div>
+  <nav>
+    <div class="section-label">Getting Started</div>
+    <a href="#overview">Overview</a>
+    <a href="#base-url">Base URL</a>
+    <a href="#auth">Authentication</a>
+    <a href="#rate-limiting">Rate Limiting</a>
+
+    <div class="section-label">Auth Endpoints</div>
+    <a href="#register">Register</a>
+    <a href="#login">Login</a>
+    <a href="#create-key">Create API Key</a>
+    <a href="#list-keys">List API Keys</a>
+    <a href="#revoke-key">Revoke API Key</a>
+
+    <div class="section-label">Core Endpoints</div>
+    <a href="#health">Health Check</a>
+    <a href="#parse">Parse PDF</a>
+    <a href="#extract">Extract with Schema</a>
+    <a href="#mcp">MCP Server</a>
+
+    <div class="section-label">Links</div>
+    <a href="index.html">Home</a>
+  </nav>
+</aside>
+
+<main class="content">
+
+<h1>API Documentation</h1>
+<p>Complete reference for the DocForge PDF extraction API.</p>
+
+<!-- Overview -->
+<h2 id="overview">Overview</h2>
+<p>DocForge is a REST API for extracting structured data from PDF documents. It supports three modes of operation:</p>
+<ul>
+  <li><strong>Parse</strong> &mdash; Convert a PDF to structured markdown with tables and metadata.</li>
+  <li><strong>Extract</strong> &mdash; Use Claude AI to extract fields matching a JSON schema from a PDF.</li>
+  <li><strong>MCP</strong> &mdash; JSON-RPC endpoint compatible with the Model Context Protocol for AI agent integration.</li>
+</ul>
+
+<!-- Base URL -->
+<h2 id="base-url">Base URL</h2>
+<pre><code>http://localhost:8080</code></pre>
+<p>In production, replace with your deployed domain and use HTTPS.</p>
+
+<!-- Authentication -->
+<h2 id="auth">Authentication</h2>
+<p>DocForge supports two authentication methods:</p>
+
+<h3>1. JWT Bearer Token</h3>
+<p>Register an account and log in to receive a JWT. Pass it in the <code>Authorization</code> header:</p>
+<pre><code>Authorization: Bearer eyJhbGciOiJIUzI1NiIs...</code></pre>
+<p>Tokens expire after the configured <code>JWT_EXPIRY_MINUTES</code> (default: 15 minutes).</p>
+
+<h3>2. API Key</h3>
+<p>Create an API key via the <code>/api-keys</code> endpoint. Pass it in the <code>X-API-Key</code> header:</p>
+<pre><code>X-API-Key: df_abc123def456...</code></pre>
+<p>API keys do not expire but can be revoked at any time.</p>
+
+<div class="alert alert-info">The <code>/health</code> endpoint requires no authentication. All other endpoints require either a JWT or API key.</div>
+
+<!-- Rate Limiting -->
+<h2 id="rate-limiting">Rate Limiting</h2>
+<p>All endpoints are rate-limited per identity (API key or IP address).</p>
+<table>
+  <tr><th>Header</th><th>Description</th></tr>
+  <tr><td><code>X-RateLimit-Limit</code></td><td>Maximum requests per minute</td></tr>
+  <tr><td><code>X-RateLimit-Remaining</code></td><td>Remaining requests in the current window</td></tr>
+</table>
+<p>Default limit: <strong>60 requests/minute</strong>. Exceeding the limit returns <code>429 Too Many Requests</code>.</p>
+
+<!-- Auth Endpoints -->
+<h2 id="register"><span class="method method-post">POST</span> <span class="endpoint-path">/auth/register</span></h2>
+<p>Create a new user account.</p>
+
+<h3>Request Body</h3>
+<pre><code>{
+  <span class="key">"email"</span>: <span class="string">"user@example.com"</span>,
+  <span class="key">"password"</span>: <span class="string">"securepassword123"</span>
+}</code></pre>
+
+<h3>Response <code>201 Created</code></h3>
+<pre><code>{
+  <span class="key">"id"</span>: <span class="string">"550e8400-e29b-41d4-a716-446655440000"</span>,
+  <span class="key">"email"</span>: <span class="string">"user@example.com"</span>,
+  <span class="key">"created_at"</span>: <span class="string">"2026-04-05T10:30:00Z"</span>
+}</code></pre>
+
+<h2 id="login"><span class="method method-post">POST</span> <span class="endpoint-path">/auth/login</span></h2>
+<p>Authenticate and receive a JWT.</p>
+
+<h3>Request Body</h3>
+<pre><code>{
+  <span class="key">"email"</span>: <span class="string">"user@example.com"</span>,
+  <span class="key">"password"</span>: <span class="string">"securepassword123"</span>
+}</code></pre>
+
+<h3>Response <code>200 OK</code></h3>
+<pre><code>{
+  <span class="key">"token"</span>: <span class="string">"eyJhbGciOiJIUzI1NiIs..."</span>,
+  <span class="key">"expires_in"</span>: <span class="number">900</span>
+}</code></pre>
+
+<h2 id="create-key"><span class="method method-post">POST</span> <span class="endpoint-path">/api-keys</span></h2>
+<p>Create a new API key. Requires JWT authentication.</p>
+
+<h3>Request Body</h3>
+<pre><code>{
+  <span class="key">"name"</span>: <span class="string">"My Integration"</span>
+}</code></pre>
+
+<h3>Response <code>201 Created</code></h3>
+<pre><code>{
+  <span class="key">"id"</span>: <span class="string">"key_abc123"</span>,
+  <span class="key">"name"</span>: <span class="string">"My Integration"</span>,
+  <span class="key">"key"</span>: <span class="string">"df_abc123def456..."</span>,
+  <span class="key">"created_at"</span>: <span class="string">"2026-04-05T10:30:00Z"</span>
+}</code></pre>
+
+<div class="alert alert-warn">The full API key is only returned once at creation time. Store it securely.</div>
+
+<h2 id="list-keys"><span class="method method-get">GET</span> <span class="endpoint-path">/api-keys</span></h2>
+<p>List all API keys for the authenticated user. Requires JWT authentication.</p>
+
+<h3>Response <code>200 OK</code></h3>
+<pre><code>{
+  <span class="key">"keys"</span>: [
+    {
+      <span class="key">"id"</span>: <span class="string">"key_abc123"</span>,
+      <span class="key">"name"</span>: <span class="string">"My Integration"</span>,
+      <span class="key">"prefix"</span>: <span class="string">"df_abc1..."</span>,
+      <span class="key">"created_at"</span>: <span class="string">"2026-04-05T10:30:00Z"</span>
+    }
+  ]
+}</code></pre>
+
+<h2 id="revoke-key"><span class="method method-delete">DELETE</span> <span class="endpoint-path">/api-keys/{key_id}</span></h2>
+<p>Revoke an API key. Requires JWT authentication.</p>
+
+<h3>Response <code>200 OK</code></h3>
+<pre><code>{
+  <span class="key">"message"</span>: <span class="string">"API key revoked"</span>
+}</code></pre>
+
+<!-- Core Endpoints -->
+<h2 id="health"><span class="method method-get">GET</span> <span class="endpoint-path">/health</span></h2>
+<p>Health check endpoint. No authentication required.</p>
+
+<h3>Response <code>200 OK</code></h3>
+<pre><code>{
+  <span class="key">"status"</span>: <span class="string">"healthy"</span>,
+  <span class="key">"uptime_seconds"</span>: <span class="number">3621</span>
+}</code></pre>
+
+<h2 id="parse"><span class="method method-post">POST</span> <span class="endpoint-path">/v1/parse</span></h2>
+<p>Parse a PDF into structured markdown. Accepts a multipart file upload.</p>
+
+<h3>Request</h3>
+<pre><code><span class="comment"># Using curl</span>
+curl -X POST http://localhost:8080/v1/parse \
+  -H "X-API-Key: your_api_key" \
+  -F "file=@document.pdf"</code></pre>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+  <tr><td><code>file</code></td><td>File (multipart)</td><td>PDF file to parse (max 50 MB)</td></tr>
+</table>
+
+<h3>Response <code>200 OK</code></h3>
+<pre><code>{
+  <span class="key">"markdown"</span>: <span class="string">"# Document Title\n\nParagraph text...\n\n| Col A | Col B |\n|-------|-------|\n| 1     | 2     |"</span>,
+  <span class="key">"page_count"</span>: <span class="number">5</span>,
+  <span class="key">"metadata"</span>: {
+    <span class="key">"title"</span>: <span class="string">"Document Title"</span>,
+    <span class="key">"author"</span>: <span class="string">"John Doe"</span>,
+    <span class="key">"creator"</span>: <span class="string">"Microsoft Word"</span>
+  },
+  <span class="key">"request_id"</span>: <span class="string">"req_abc123"</span>
+}</code></pre>
+
+<h2 id="extract"><span class="method method-post">POST</span> <span class="endpoint-path">/v1/extract</span></h2>
+<p>Extract structured fields from a PDF using Claude AI. Provide a JSON schema describing the fields you want extracted.</p>
+
+<h3>Request</h3>
+<pre><code><span class="comment"># Using curl</span>
+curl -X POST http://localhost:8080/v1/extract \
+  -H "X-API-Key: your_api_key" \
+  -F "file=@invoice.pdf" \
+  -F 'schema={"vendor": "string", "total": "number", "line_items": [{"description": "string", "amount": "number"}]}'</code></pre>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+  <tr><td><code>file</code></td><td>File (multipart)</td><td>PDF file to extract from (max 50 MB)</td></tr>
+  <tr><td><code>schema</code></td><td>JSON string (multipart)</td><td>JSON schema defining the fields to extract</td></tr>
+</table>
+
+<h3>Response <code>200 OK</code></h3>
+<pre><code>{
+  <span class="key">"data"</span>: {
+    <span class="key">"vendor"</span>: <span class="string">"Acme Corp"</span>,
+    <span class="key">"total"</span>: <span class="number">1250.00</span>,
+    <span class="key">"line_items"</span>: [
+      { <span class="key">"description"</span>: <span class="string">"Widget A"</span>, <span class="key">"amount"</span>: <span class="number">750.00</span> },
+      { <span class="key">"description"</span>: <span class="string">"Widget B"</span>, <span class="key">"amount"</span>: <span class="number">500.00</span> }
+    ]
+  },
+  <span class="key">"confidence"</span>: <span class="number">0.95</span>,
+  <span class="key">"request_id"</span>: <span class="string">"req_def456"</span>
+}</code></pre>
+
+<div class="alert alert-info">Schema extraction requires a valid <code>ANTHROPIC_API_KEY</code> in the server configuration. Without it, the endpoint returns a stub response.</div>
+
+<h2 id="mcp"><span class="method method-post">POST</span> <span class="endpoint-path">/mcp</span></h2>
+<p>Model Context Protocol (JSON-RPC 2.0) endpoint. Supports tool discovery and invocation by MCP-compatible AI clients.</p>
+
+<h3>Supported Methods</h3>
+<table>
+  <tr><th>Method</th><th>Description</th></tr>
+  <tr><td><code>initialize</code></td><td>Initialize the MCP session and discover server capabilities</td></tr>
+  <tr><td><code>tools/list</code></td><td>List available tools (<code>parse_pdf</code>, <code>extract_pdf</code>)</td></tr>
+  <tr><td><code>tools/call</code></td><td>Invoke a tool with arguments</td></tr>
+</table>
+
+<h3>Example: Initialize</h3>
+<pre><code><span class="comment">// Request</span>
+{
+  <span class="key">"jsonrpc"</span>: <span class="string">"2.0"</span>,
+  <span class="key">"id"</span>: <span class="number">1</span>,
+  <span class="key">"method"</span>: <span class="string">"initialize"</span>,
+  <span class="key">"params"</span>: {}
+}
+
+<span class="comment">// Response</span>
+{
+  <span class="key">"jsonrpc"</span>: <span class="string">"2.0"</span>,
+  <span class="key">"id"</span>: <span class="number">1</span>,
+  <span class="key">"result"</span>: {
+    <span class="key">"protocolVersion"</span>: <span class="string">"2024-11-05"</span>,
+    <span class="key">"serverInfo"</span>: { <span class="key">"name"</span>: <span class="string">"docforge"</span>, <span class="key">"version"</span>: <span class="string">"0.1.0"</span> },
+    <span class="key">"capabilities"</span>: { <span class="key">"tools"</span>: { <span class="key">"listChanged"</span>: false } }
+  }
+}</code></pre>
+
+<h3>Example: Call parse_pdf</h3>
+<pre><code><span class="comment">// Request</span>
+{
+  <span class="key">"jsonrpc"</span>: <span class="string">"2.0"</span>,
+  <span class="key">"id"</span>: <span class="number">2</span>,
+  <span class="key">"method"</span>: <span class="string">"tools/call"</span>,
+  <span class="key">"params"</span>: {
+    <span class="key">"name"</span>: <span class="string">"parse_pdf"</span>,
+    <span class="key">"arguments"</span>: {
+      <span class="key">"pdf_base64"</span>: <span class="string">"JVBERi0xLjQK..."</span>
+    }
+  }
+}</code></pre>
+
+<!-- Error Responses -->
+<h2 id="errors">Error Responses</h2>
+<p>All errors follow a consistent format:</p>
+<pre><code>{
+  <span class="key">"error"</span>: <span class="string">"Description of what went wrong"</span>
+}</code></pre>
+
+<table>
+  <tr><th>Status</th><th>Meaning</th></tr>
+  <tr><td><code>400</code></td><td>Bad request (missing fields, invalid input)</td></tr>
+  <tr><td><code>401</code></td><td>Unauthorized (missing or invalid credentials)</td></tr>
+  <tr><td><code>404</code></td><td>Resource not found</td></tr>
+  <tr><td><code>409</code></td><td>Conflict (e.g., duplicate email)</td></tr>
+  <tr><td><code>413</code></td><td>Payload too large (max 50 MB)</td></tr>
+  <tr><td><code>429</code></td><td>Rate limit exceeded</td></tr>
+  <tr><td><code>500</code></td><td>Internal server error</td></tr>
+</table>
+
+</main>
+</div>
+
+</body>
+</html>

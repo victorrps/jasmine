@@ -1,0 +1,22 @@
+version: "3.8"
+services:
+  docforge:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - docforge_data:/app/data
+    env_file:
+      - .env.docker
+    environment:
+      - HOST=0.0.0.0
+      - DATABASE_URL=sqlite:///app/data/docforge.db?mode=rwc
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  docforge_data:

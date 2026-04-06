@@ -1,0 +1,26 @@
+# Rust
+/target
+
+# Secrets and local config
+.env
+.env.docker
+.env.local
+
+# SQLite dev databases
+*.db
+*.db-shm
+*.db-wal
+
+# PaddleOCR sidecar virtualenv
+.venv-paddle/
+
+# Generated / scratch output
+output/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+__pycache__/
