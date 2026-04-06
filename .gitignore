@@ -24,3 +24,4 @@ output/
 .vscode/
 *.swp
 __pycache__/
+NEXT_FIXES.md

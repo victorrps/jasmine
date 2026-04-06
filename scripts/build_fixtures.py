@@ -69,8 +69,6 @@ def build_multipage_report() -> Path:
             )
         )
         flow.append(Paragraph("Page break below.", styles["BodyText"]))
-        from reportlab.platypus import PageBreak
-
         if i < 3:
             flow.append(PageBreak())
     doc.build(flow)

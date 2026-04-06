@@ -41,8 +41,10 @@ pub enum PdfClass {
 }
 
 /// Raw signals the classifier computed. Exposed so the router can log them
-/// per request for future threshold tuning.
-#[derive(Debug, Clone, Copy, Serialize)]
+/// per request for future threshold tuning. Not serialized — this is a
+/// server-internal structure kept out of API responses so callers can't
+/// reverse-engineer the routing thresholds.
+#[derive(Debug, Clone, Copy)]
 pub struct ClassifierSignals {
     pub page_count: u32,
     pub chars_per_page: f64,
@@ -56,10 +58,29 @@ pub struct ClassifierSignals {
 }
 
 /// Full classifier output — class plus the evidence that led to it.
-#[derive(Debug, Clone, Copy, Serialize)]
+///
+/// Do **not** serialize this into an API response. The raw signal values
+/// allow a curious caller to reverse-engineer the classifier thresholds and
+/// craft documents that reliably force expensive routing decisions. Keep it
+/// server-side only (logs, internal metrics). The public projection that
+/// ships to clients is [`ClassificationSummary`].
+#[derive(Debug, Clone, Copy)]
 pub struct ClassificationReport {
     pub class: PdfClass,
     pub signals: ClassifierSignals,
+}
+
+/// Client-facing projection of a classification result. Only exposes the
+/// coarse class, not the raw numeric signals.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ClassificationSummary {
+    pub class: PdfClass,
+}
+
+impl From<ClassificationReport> for ClassificationSummary {
+    fn from(report: ClassificationReport) -> Self {
+        Self { class: report.class }
+    }
 }
 
 // ── Thresholds (v1, hand-picked) ─────────────────────────────────────────────
@@ -80,6 +101,11 @@ const COLUMN_ALIGNMENT_STRONG: f64 = 0.40;
 /// also counts as structured. Catches mixed documents where neither signal
 /// alone is strong but both contribute.
 const COMBINED_WEAK_SIGNAL: f64 = 0.25;
+
+/// Upper bound on lines walked during classification. Prevents a pathological
+/// PDF with millions of lines from pinning a CPU core. 5 000 non-empty lines
+/// is ≈ 80 pages of dense text — plenty for classification confidence.
+const MAX_CLASSIFIER_LINES: usize = 5_000;
 
 /// Classify a parsed document. Pure function — safe to call anywhere.
 pub fn classify(doc: &DocumentResult) -> ClassificationReport {
@@ -125,6 +151,7 @@ fn compute_signals(doc: &DocumentResult) -> ClassifierSignals {
         .text
         .lines()
         .filter(|l| !l.trim().is_empty())
+        .take(MAX_CLASSIFIER_LINES)
         .collect();
     let total_lines = lines.len().max(1) as f64;
 
@@ -164,9 +191,15 @@ fn looks_like_label_line(line: &str) -> bool {
     if !first.is_ascii_uppercase() {
         return false;
     }
-    let prefix = &trimmed[..trimmed.len().min(80)];
+    // Slice at a UTF-8 char boundary — slicing at byte 80 would panic on
+    // multi-byte chars (CJK, emoji, em-dash, etc.) in adversarial PDF text.
+    let cut = trimmed
+        .char_indices()
+        .nth(80)
+        .map_or(trimmed.len(), |(i, _)| i);
+    let prefix = &trimmed[..cut];
     let colon = match prefix.find(": ") {
-        Some(i) if i >= 1 && i <= 30 => i,
+        Some(i) if (1..=30).contains(&i) => i,
         _ => return false,
     };
     let label = &trimmed[..colon];
