@@ -15,6 +15,7 @@ PDF data extraction API — structured, LLM-ready output from any PDF in a singl
 - **Rate limiting** — per-API-key and per-IP (tighter on auth endpoints)
 - **Request tracing** — UUID request IDs in headers and structured JSON logs
 - **Local processing** — no customer PDFs leave the server
+- **Production hardening** — request deadline, per-instance concurrency cap, encrypted-PDF detection, structured errors with `retryable` flag, Prometheus `/metrics`, idempotency-key replay
 
 ## Quickstart
 
@@ -70,10 +71,18 @@ Requirements: Python 3.9–3.12 with `python3-venv` installed.
 
 ## API Reference
 
-### Health
+### Health & metrics
 ```bash
 curl http://localhost:8080/health
+curl http://localhost:8080/metrics    # Prometheus text format — protect via network policy
 ```
+
+`/metrics` exposes `parse_requests_total{endpoint,status}`,
+`parse_duration_seconds{backend}`, `classifier_class_total{class}`,
+`paddle_degraded_total`, `parse_gate_in_flight`, and
+`extract_validation_failures_total`. Both `/health` and `/metrics` are
+unauthenticated by design — bind them to a private interface or
+firewall them off in production.
 
 ### Register / Login
 ```bash
@@ -140,6 +149,42 @@ curl -X POST http://localhost:8080/v1/extract \
   -F 'schema={"type":"object","properties":{"invoice_number":{"type":"string"},"amount":{"type":"number"}}}'
 ```
 
+### Idempotent retries
+
+Both `/v1/parse` and `/v1/extract` accept an `Idempotency-Key` header
+(max 128 chars). The first call runs normally; subsequent calls within
+24 h with the same key from the same API key replay the cached body
+verbatim and add an `X-Idempotent-Replay: true` response header. Replays
+**do not** consume gate permits, log usage, or charge billing.
+
+```bash
+curl -X POST http://localhost:8080/v1/parse \
+  -H "X-API-Key: df_live_..." \
+  -H "Idempotency-Key: invoice-2026-04-06-001" \
+  -F "file=@invoice.pdf"
+```
+
+The cache is in-process and per-instance. See
+`docs/DEFERRED_INFRA.md` for the multi-instance (Redis) follow-up.
+
+### Error envelope
+
+All errors return a structured body so SDKs can drive retry logic:
+
+```json
+{
+  "error": "service unavailable",
+  "code": "service_unavailable",
+  "request_id": "req_...",
+  "retryable": true
+}
+```
+
+`retryable: true` means the client should back off and retry (503
+busy, 504 deadline, 429 quota). `retryable: false` means the request
+will fail the same way every time (400, 401, 403, 413, 422). 503
+responses also include a `Retry-After: 5` header.
+
 ### Batch
 ```bash
 # Sync
@@ -165,6 +210,9 @@ curl http://localhost:8080/billing/plans
 | `DATABASE_URL` | ✅ | `sqlite://docforge.db?mode=rwc` for dev |
 | `HOST` / `PORT` | optional | defaults `127.0.0.1:8080` |
 | `RATE_LIMIT_PER_MINUTE` | optional | default `60` |
+| `MAX_CONCURRENT_PARSES` | optional | default `8` — per-instance concurrency cap; saturates → 503 + Retry-After:5 |
+| `PARSE_DEADLINE_SECS` | optional | default `90` — wall-clock budget for the dispatcher; exceeded → 504 |
+| `EXTRACT_MAX_INPUT_CHARS` | optional | default `200000` — max markdown chars sent to schema extractor; exceeded → 413 |
 | `JWT_EXPIRY_MINUTES` | optional | default `15` |
 | `PADDLEOCR_URL` | optional | e.g. `http://localhost:8868` |
 | `PADDLEOCR_TIMEOUT_SECS` | optional | default `120` |
@@ -201,6 +249,24 @@ See `.env.example` for a full template.
 | Password hash | Argon2id | OWASP recommended |
 | API key hash | HMAC-SHA256 + pepper | Prevents offline brute-force if DB leaks |
 | Auth | JWT (users) + API keys (services) | Humans vs. machines |
+
+## Markdown dialect per backend
+
+The `markdown` field in the response varies by which backend produced
+it. We document the dialects rather than normalizing them so callers
+know what to expect — a normalization pass is deferred.
+
+| Backend | Headings | Tables | Images | Page breaks | Notes |
+|---|---|---|---|---|---|
+| `pdf_oxide` | ATX (`# Heading`) inferred from font weight/size | GitHub pipe tables when borders are detected; otherwise plain text | not extracted | `## Page N` separators on multi-page docs | Plain prose comes through cleanly; complex layouts collapse to linear text |
+| `paddle` (PP-StructureV3) | ATX, hierarchy preserved by the layout model | Pipe tables with header row | Referenced as `![](images/...)` (paths are sidecar-local) | `concatenate_markdown_pages` handles cross-page tables natively | Highest fidelity for structured docs |
+| `tesseract` | none (line breaks only) | none | none | `## Page N` separators | Lowest fidelity; used only when both pdf_oxide and Paddle fail or are unavailable |
+
+**Stable subset across all backends:** plain paragraphs separated by
+blank lines, line breaks within paragraphs, UTF-8 text. Anything beyond
+that (headings, tables, images, page markers) is best-effort and
+backend-specific. If you need a guaranteed shape, use `/v1/extract`
+with a JSON schema rather than parsing the markdown directly.
 
 ## Security
 
