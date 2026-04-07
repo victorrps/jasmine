@@ -167,12 +167,16 @@ impl AppError {
     /// the response envelope so SDKs can drive retry-with-backoff.
     pub fn retryable(&self) -> bool {
         match self {
-            // Transient infrastructure errors
+            // Transient infrastructure errors. `PdfProcessing` lives here
+            // because it carries subprocess failures (tesseract crash,
+            // pdftoppm exit code, missing OCR pages) — the same input may
+            // succeed on a retry once load drops or the helper recovers.
             Self::DeadlineExceeded
             | Self::ServiceBusy
             | Self::Internal(_)
             | Self::Database(_)
-            | Self::UpstreamApi(_) => true,
+            | Self::UpstreamApi(_)
+            | Self::PdfProcessing(_) => true,
 
             // Permanent client-fault errors
             Self::InvalidCredentials
@@ -183,7 +187,6 @@ impl AppError {
             | Self::NotFound
             | Self::FileTooLarge
             | Self::InvalidPdf
-            | Self::PdfProcessing(_)
             | Self::QuotaExceeded(_)
             | Self::NotImplemented(_)
             | Self::EncryptedPdf
@@ -339,6 +342,10 @@ mod tests {
         assert!(AppError::ServiceBusy.retryable());
         assert!(AppError::Internal("x".into()).retryable());
         assert!(AppError::UpstreamApi("x".into()).retryable());
+        assert!(
+            AppError::PdfProcessing("tesseract exited with code 1".into()).retryable(),
+            "OCR subprocess failures are transient — clients should retry"
+        );
     }
 
     #[test]

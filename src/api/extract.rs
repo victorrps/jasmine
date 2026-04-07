@@ -45,8 +45,8 @@ pub async fn extract_pdf(
         crate::api::parse::record_outcome(&metrics, "/v1/extract", "503", None, started);
         AppError::ServiceBusy
     })?;
-    metrics.parse_gate_in_flight.inc();
-    let _gate_guard = crate::api::parse::GateGaugeGuard(metrics.clone());
+    // Atomic inc + drop guard — see GateGaugeGuard::new in parse.rs.
+    let _gate_guard = crate::api::parse::GateGaugeGuard::new(metrics.clone());
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
         return Err(AppError::QuotaExceeded(format!(

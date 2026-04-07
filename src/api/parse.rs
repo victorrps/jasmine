@@ -66,8 +66,9 @@ pub async fn parse_pdf(
         record_outcome(&metrics, "/v1/parse", "503", None, started);
         AppError::ServiceBusy
     })?;
-    metrics.parse_gate_in_flight.inc();
-    let _gate_guard = GateGaugeGuard(metrics.clone());
+    // Construct the guard atomically with the inc — never inc separately,
+    // see GateGaugeGuard::new docs for the cancellation rationale.
+    let _gate_guard = GateGaugeGuard::new(metrics.clone());
 
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
@@ -128,10 +129,18 @@ pub async fn parse_pdf(
         metrics.paddle_degraded.inc();
     }
     if let Some(ref class) = result.document.metadata.classification {
+        // Stable label strings — never derive from `Debug`, which would
+        // silently rename a metric series the day a new variant is added.
+        let label = match class.class {
+            crate::services::pdf_classifier::PdfClass::TextSimple => "text_simple",
+            crate::services::pdf_classifier::PdfClass::TextStructured => "text_structured",
+            crate::services::pdf_classifier::PdfClass::ScannedOrEmpty => "scanned_or_empty",
+            crate::services::pdf_classifier::PdfClass::Unknown => "unknown",
+        };
         metrics
             .classifier_class
             .get_or_create(&crate::services::metrics::ClassifierLabels {
-                class: format!("{:?}", class.class).to_lowercase(),
+                class: label.into(),
             })
             .inc();
     }
@@ -178,7 +187,7 @@ pub async fn parse_pdf(
             idem.put(
                 cache_key,
                 CachedResponse {
-                    status: 200,
+                    status: actix_web::http::StatusCode::OK,
                     body: body_bytes.clone(),
                     content_type: "application/json".into(),
                     stored_at: Instant::now(),
@@ -199,19 +208,21 @@ fn read_idempotency_key(req: &HttpRequest) -> Result<Option<String>, AppError> {
     let Some(raw) = req.headers().get("idempotency-key") else {
         return Ok(None);
     };
-    let s = raw
+    let raw_str = raw
         .to_str()
-        .map_err(|_| AppError::Validation("Idempotency-Key must be ASCII".into()))?
-        .trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
-    if s.len() > MAX_KEY_LEN {
+        .map_err(|_| AppError::Validation("Idempotency-Key must be ASCII".into()))?;
+    // Check the *raw* length first so a client can't smuggle a key past
+    // the cap by surrounding it with whitespace.
+    if raw_str.len() > MAX_KEY_LEN {
         return Err(AppError::Validation(format!(
             "Idempotency-Key too long ({} > {} chars)",
-            s.len(),
+            raw_str.len(),
             MAX_KEY_LEN
         )));
+    }
+    let s = raw_str.trim();
+    if s.is_empty() {
+        return Ok(None);
     }
     Ok(Some(s.to_string()))
 }
@@ -219,10 +230,7 @@ fn read_idempotency_key(req: &HttpRequest) -> Result<Option<String>, AppError> {
 /// Build an `HttpResponse` from a cached entry, marking the replay
 /// with the `X-Idempotent-Replay: true` header so callers can tell.
 fn replay_cached(cached: CachedResponse) -> HttpResponse {
-    let mut builder = HttpResponse::build(
-        actix_web::http::StatusCode::from_u16(cached.status)
-            .unwrap_or(actix_web::http::StatusCode::OK),
-    );
+    let mut builder = HttpResponse::build(cached.status);
     builder
         .insert_header(("X-Idempotent-Replay", "true"))
         .content_type(cached.content_type);
@@ -304,11 +312,22 @@ pub async fn extract_parse_upload(
     Ok((Arc::<[u8]>::from(bytes), hint))
 }
 
-/// RAII helper that decrements `parse_gate_in_flight` when dropped.
-/// Mirrors the lifetime of the semaphore permit so the gauge stays in
-/// sync with the actual in-flight permit count even on early-return
-/// error paths.
-pub(crate) struct GateGaugeGuard(pub web::Data<Metrics>);
+/// RAII helper that increments `parse_gate_in_flight` on construction
+/// and decrements it on drop. Mirrors the lifetime of the semaphore
+/// permit so the gauge stays in sync with the actual in-flight permit
+/// count, even on early-return error paths and async cancellations.
+///
+/// **Always construct via `GateGaugeGuard::new(metrics)`** so the
+/// increment and the drop guard are paired atomically — never call
+/// `inc()` separately, since async cancellation between the inc and
+/// the guard binding would leak the gauge by +1 forever.
+pub(crate) struct GateGaugeGuard(web::Data<Metrics>);
+impl GateGaugeGuard {
+    pub(crate) fn new(metrics: web::Data<Metrics>) -> Self {
+        metrics.parse_gate_in_flight.inc();
+        Self(metrics)
+    }
+}
 impl Drop for GateGaugeGuard {
     fn drop(&mut self) {
         self.0.parse_gate_in_flight.dec();
@@ -332,17 +351,20 @@ pub(crate) fn record_outcome(
             status: status.into(),
         })
         .inc();
-    if let Some(b) = backend {
-        let backend_label = match b {
-            pdf_parser::RoutedTo::PdfOxide => "pdf_oxide",
-            pdf_parser::RoutedTo::Paddle => "paddle",
-            pdf_parser::RoutedTo::Tesseract => "tesseract",
-        };
-        metrics
-            .parse_duration
-            .get_or_create(&BackendLabels {
-                backend: backend_label.into(),
-            })
-            .observe(started.elapsed().as_secs_f64());
-    }
+    // Always observe latency, even when no backend was selected (early
+    // 503/504/4xx error paths). Without this the histogram only reflects
+    // successes and the tail latency that matters most — deadline
+    // exceedances and gate saturation — disappears from the dashboard.
+    let backend_label = match backend {
+        Some(pdf_parser::RoutedTo::PdfOxide) => "pdf_oxide",
+        Some(pdf_parser::RoutedTo::Paddle) => "paddle",
+        Some(pdf_parser::RoutedTo::Tesseract) => "tesseract",
+        None => "none",
+    };
+    metrics
+        .parse_duration
+        .get_or_create(&BackendLabels {
+            backend: backend_label.into(),
+        })
+        .observe(started.elapsed().as_secs_f64());
 }

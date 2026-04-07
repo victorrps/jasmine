@@ -28,21 +28,37 @@
 //!
 //! ## Memory bound
 //!
-//! `cache_size` * `max_body_bytes` is the worst-case resident set
-//! (default 10 000 * 1 MiB ≈ 10 GiB). For tighter footprints, lower
-//! `max_body_bytes` to e.g. 64 KiB so the bound becomes ~640 MiB.
+//! `cache_size` * `max_body_bytes` is the worst-case resident set.
+//! Defaults: 1 024 entries × 1 MiB ≈ 1 GiB worst case (typical real
+//! parse responses are 5–50 KiB so steady-state is ~50 MiB). Operators
+//! who need a tighter footprint can lower `max_body_bytes` to 64 KiB,
+//! which drops the worst case to ~64 MiB at the cost of bypassing the
+//! cache for any document larger than that.
+//!
+//! ## Mutex poisoning
+//!
+//! The internal `Mutex` uses poison-recovery (`PoisonError::into_inner`)
+//! rather than failing closed. The cached `CachedResponse` values are
+//! plain owned data (no interior invariants that a panic could leave
+//! half-set), so reusing the data after a panicking operation is safe
+//! and dramatically better than silently disabling idempotency for the
+//! lifetime of the process.
 
+use actix_web::http::StatusCode;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Maximum allowed length for an `Idempotency-Key` header value.
 pub const MAX_KEY_LEN: usize = 128;
 
-/// Default LRU capacity. Configurable via `AppConfig` later if needed.
-pub const DEFAULT_CACHE_SIZE: usize = 10_000;
+/// Default LRU capacity. 1 024 entries × `DEFAULT_MAX_BODY_BYTES`
+/// (1 MiB) gives a 1 GiB worst-case resident set; typical parse
+/// responses are 5–50 KiB so the steady-state footprint is closer to
+/// 50 MiB.
+pub const DEFAULT_CACHE_SIZE: usize = 1024;
 
 /// Default cache TTL. 24 hours mirrors Stripe's idempotency window.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -50,10 +66,13 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default per-entry body size cap. Larger bodies bypass the cache.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// A cached response, ready to be replayed verbatim.
+/// A cached response, ready to be replayed verbatim. `status` is stored
+/// as a typed `StatusCode` so we cannot accidentally promote a malformed
+/// 4xx into a `200 OK` on replay (the previous `u16 + unwrap_or(OK)`
+/// shape silently lost the original status on bad input).
 #[derive(Clone, Debug)]
 pub struct CachedResponse {
-    pub status: u16,
+    pub status: StatusCode,
     pub body: Vec<u8>,
     pub content_type: String,
     pub stored_at: Instant,
@@ -84,6 +103,14 @@ impl IdempotencyCache {
         Self::new(DEFAULT_CACHE_SIZE, DEFAULT_TTL, DEFAULT_MAX_BODY_BYTES)
     }
 
+    /// Lock the inner cache, recovering from a poisoned mutex. The
+    /// `LruCache` value has no broken invariants a panic could leave
+    /// behind, so reusing the data is strictly better than failing
+    /// closed and silently disabling idempotency forever.
+    fn lock(&self) -> MutexGuard<'_, LruCache<String, CachedResponse>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Per-entry body size cap. Responses larger than this bypass the
     /// cache entirely (caller can detect this via `should_cache`).
     #[allow(dead_code)]
@@ -111,7 +138,7 @@ impl IdempotencyCache {
     /// still within the TTL window — expired entries are evicted on hit
     /// (lazy reaping).
     pub fn get(&self, key: &str) -> Option<CachedResponse> {
-        let mut guard = self.inner.lock().ok()?;
+        let mut guard = self.lock();
         let entry = guard.get(key)?.clone();
         if entry.stored_at.elapsed() > self.ttl {
             guard.pop(key);
@@ -127,15 +154,13 @@ impl IdempotencyCache {
         if response.body.len() > self.max_body_bytes {
             return;
         }
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.put(key, response);
-        }
+        self.lock().put(key, response);
     }
 
     /// Number of entries currently held. Test/observability only.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.len()).unwrap_or(0)
+        self.lock().len()
     }
 
     /// True when the cache holds zero entries.
@@ -157,7 +182,7 @@ mod tests {
 
     fn sample(body: &[u8]) -> CachedResponse {
         CachedResponse {
-            status: 200,
+            status: StatusCode::OK,
             body: body.to_vec(),
             content_type: "application/json".into(),
             stored_at: Instant::now(),
@@ -178,7 +203,7 @@ mod tests {
         cache.put(key.clone(), sample(b"hello"));
         let got = cache.get(&key).unwrap();
         assert_eq!(got.body, b"hello");
-        assert_eq!(got.status, 200);
+        assert_eq!(got.status, StatusCode::OK);
     }
 
     #[test]
@@ -214,6 +239,28 @@ mod tests {
         assert!(cache.should_cache(50));
         assert!(cache.should_cache(100));
         assert!(!cache.should_cache(101));
+    }
+
+    #[test]
+    fn cache_survives_mutex_poisoning() {
+        use std::sync::Arc;
+        let cache = Arc::new(IdempotencyCache::with_defaults());
+        cache.put("k".into(), sample(b"before-panic"));
+
+        // Poison the inner mutex from a panicking thread.
+        let c2 = cache.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.inner.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+
+        // Cache must still serve the previously stored entry rather than
+        // failing closed for the rest of the process lifetime.
+        let got = cache.get("k").expect("poisoned cache must still serve reads");
+        assert_eq!(got.body, b"before-panic");
+        cache.put("k2".into(), sample(b"after-poison"));
+        assert_eq!(cache.get("k2").unwrap().body, b"after-poison");
     }
 
     #[test]
