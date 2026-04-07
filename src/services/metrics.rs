@@ -32,22 +32,31 @@ use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicI64;
 
 /// Labels for the parse-request counter.
+///
+/// `endpoint` is `&'static str` — construct with hardcoded literals
+/// only, never user input. `status` is `u16` — construct from
+/// `StatusCode::as_u16()`, never user input. The type system now
+/// prevents a future regression from threading attacker-controlled
+/// strings into a Prometheus label (which would explode cardinality
+/// and create a memory-exhaustion DoS surface).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ParseLabels {
-    pub endpoint: String,
-    pub status: String,
+    pub endpoint: &'static str,
+    pub status: u16,
 }
 
-/// Labels for the per-backend latency histogram.
+/// Labels for the per-backend latency histogram. `backend` must be a
+/// hardcoded literal — see [`ParseLabels`] rationale.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct BackendLabels {
-    pub backend: String,
+    pub backend: &'static str,
 }
 
-/// Labels for the classifier outcome counter.
+/// Labels for the classifier outcome counter. `class` must be a
+/// hardcoded literal — see [`ParseLabels`] rationale.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ClassifierLabels {
-    pub class: String,
+    pub class: &'static str,
 }
 
 /// All app metrics. Held as `web::Data<Metrics>` and shared across
@@ -159,8 +168,8 @@ mod tests {
     fn parse_requests_counter_increments() {
         let m = Metrics::new();
         let labels = ParseLabels {
-            endpoint: "/v1/parse".into(),
-            status: "200".into(),
+            endpoint: "/v1/parse",
+            status: 200,
         };
         m.parse_requests.get_or_create(&labels).inc();
         m.parse_requests.get_or_create(&labels).inc();
@@ -184,7 +193,7 @@ mod tests {
         let m = Metrics::new();
         m.classifier_class
             .get_or_create(&ClassifierLabels {
-                class: "text_simple".into(),
+                class: "text_simple",
             })
             .inc();
         let txt = m.encode_text().unwrap();
@@ -199,7 +208,7 @@ mod tests {
         let m = Metrics::new();
         m.parse_duration
             .get_or_create(&BackendLabels {
-                backend: "pdf_oxide".into(),
+                backend: "pdf_oxide",
             })
             .observe(0.42);
         let txt = m.encode_text().unwrap();

@@ -151,6 +151,13 @@ impl AppError {
     fn safe_message(&self) -> String {
         match self {
             Self::Database(_) | Self::Internal(_) => "An internal error occurred".into(),
+            // PdfProcessing carries subprocess stderr, tool paths, and
+            // exit codes. Surface a generic message so an attacker who
+            // can reliably trigger tesseract/pdftoppm failures cannot
+            // enumerate the host filesystem or toolchain versions.
+            Self::PdfProcessing(_) => {
+                "PDF processing failed; the document may be corrupt or unsupported".into()
+            }
             Self::QuotaExceeded(msg) => msg.clone(),
             Self::SchemaValidationFailed(detail) => {
                 format!("Extracted data did not validate against schema: {detail}")
@@ -503,10 +510,18 @@ mod tests {
     }
 
     #[test]
-    fn pdf_processing_safe_message_includes_description() {
-        let err = AppError::PdfProcessing("corrupt header".into());
+    fn pdf_processing_safe_message_does_not_leak_subprocess_details() {
+        // PdfProcessing carries subprocess stderr/paths like
+        // "tesseract exited with code 1: /var/tmp/page-3.png not found".
+        // We must not forward that to callers — scrub it to a generic
+        // user-facing message instead.
+        let err = AppError::PdfProcessing(
+            "tesseract exited with code 1: /var/tmp/page-3.png not found".into(),
+        );
         let msg = err.safe_message();
-        assert!(msg.contains("corrupt header"), "got: {msg}");
+        assert!(!msg.contains("tesseract"), "leaked tool name: {msg}");
+        assert!(!msg.contains("/var/tmp"), "leaked filesystem path: {msg}");
+        assert!(!msg.contains("exit"), "leaked subprocess detail: {msg}");
     }
 
     #[test]

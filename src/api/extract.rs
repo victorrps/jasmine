@@ -1,5 +1,5 @@
 use actix_multipart::Multipart;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpResponse, ResponseError};
 use futures_util::StreamExt;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -13,7 +13,6 @@ use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
 use crate::services::metrics::Metrics;
 use crate::services::parse_gate::ParseGate;
 use crate::services::{ocr, pdf_parser, schema_extractor};
-use actix_web::ResponseError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +42,7 @@ pub async fn extract_pdf(
 ) -> Result<HttpResponse, AppError> {
     let started = Instant::now();
     let _permit = gate.try_acquire().map_err(|_| {
-        crate::api::parse::record_outcome(&metrics, "/v1/extract", "503", None, started);
+        crate::api::parse::record_outcome(&metrics, "/v1/extract", 503, None, started);
         AppError::ServiceBusy
     })?;
     // Atomic inc + drop guard — see GateGaugeGuard::new in parse.rs.
@@ -206,13 +205,7 @@ pub async fn extract_pdf(
 
     match outcome {
         Ok((body, backend)) => {
-            crate::api::parse::record_outcome(
-                &metrics,
-                "/v1/extract",
-                "200",
-                backend,
-                started,
-            );
+            crate::api::parse::record_outcome(&metrics, "/v1/extract", 200, backend, started);
             // Log usage asynchronously — successful extractions only.
             let pool_clone = pool.get_ref().clone();
             let key_id = auth.api_key_id.clone();
@@ -243,14 +236,14 @@ pub async fn extract_pdf(
             Ok(HttpResponse::Ok().json(body))
         }
         Err(e) => {
-            // Derive the status label from the error's HTTP status so the
+            // Derive the status code from the error's HTTP status so the
             // metric matches what the client actually sees. No backend
             // label — early-exit errors did not route to a backend.
-            let status_label = e.status_code().as_u16().to_string();
+            let status_code = e.status_code().as_u16();
             crate::api::parse::record_outcome(
                 &metrics,
                 "/v1/extract",
-                &status_label,
+                status_code,
                 None,
                 started,
             );

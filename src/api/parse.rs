@@ -63,7 +63,7 @@ pub async fn parse_pdf(
     // the deadline drops the inner future the gate keeps reflecting
     // real in-flight work.
     let _permit = gate.try_acquire().map_err(|_| {
-        record_outcome(&metrics, "/v1/parse", "503", None, started);
+        record_outcome(&metrics, "/v1/parse", 503, None, started);
         AppError::ServiceBusy
     })?;
     // Construct the guard atomically with the inc — never inc separately,
@@ -103,11 +103,11 @@ pub async fn parse_pdf(
         Ok(r) => r,
         Err(e) => {
             let status = match &e {
-                AppError::DeadlineExceeded => "504",
-                AppError::EncryptedPdf => "422",
-                AppError::InvalidPdf => "400",
-                AppError::QuotaExceeded(_) => "429",
-                _ => "500",
+                AppError::DeadlineExceeded => 504,
+                AppError::EncryptedPdf => 422,
+                AppError::InvalidPdf => 400,
+                AppError::QuotaExceeded(_) => 429,
+                _ => 500,
             };
             record_outcome(&metrics, "/v1/parse", status, None, started);
             return Err(e);
@@ -116,7 +116,7 @@ pub async fn parse_pdf(
     record_outcome(
         &metrics,
         "/v1/parse",
-        "200",
+        200,
         result.document.metadata.routed_to,
         started,
     );
@@ -139,9 +139,7 @@ pub async fn parse_pdf(
         };
         metrics
             .classifier_class
-            .get_or_create(&crate::services::metrics::ClassifierLabels {
-                class: label.into(),
-            })
+            .get_or_create(&crate::services::metrics::ClassifierLabels { class: label })
             .inc();
     }
 
@@ -339,23 +337,20 @@ impl Drop for GateGaugeGuard {
 /// the `parse_requests_total` counter matches reality.
 pub(crate) fn record_outcome(
     metrics: &Metrics,
-    endpoint: &str,
-    status: &str,
+    endpoint: &'static str,
+    status: u16,
     backend: Option<pdf_parser::RoutedTo>,
     started: Instant,
 ) {
     metrics
         .parse_requests
-        .get_or_create(&ParseLabels {
-            endpoint: endpoint.into(),
-            status: status.into(),
-        })
+        .get_or_create(&ParseLabels { endpoint, status })
         .inc();
     // Always observe latency, even when no backend was selected (early
     // 503/504/4xx error paths). Without this the histogram only reflects
     // successes and the tail latency that matters most — deadline
     // exceedances and gate saturation — disappears from the dashboard.
-    let backend_label = match backend {
+    let backend_label: &'static str = match backend {
         Some(pdf_parser::RoutedTo::PdfOxide) => "pdf_oxide",
         Some(pdf_parser::RoutedTo::Paddle) => "paddle",
         Some(pdf_parser::RoutedTo::Tesseract) => "tesseract",
@@ -364,7 +359,7 @@ pub(crate) fn record_outcome(
     metrics
         .parse_duration
         .get_or_create(&BackendLabels {
-            backend: backend_label.into(),
+            backend: backend_label,
         })
         .observe(started.elapsed().as_secs_f64());
 }
