@@ -397,6 +397,49 @@ async fn test_metrics_endpoint_serves_text_format_with_counters_after_parse() {
 }
 
 #[actix_rt::test]
+async fn test_extract_records_outcome_on_early_validation_error() {
+    // POST /v1/extract with a payload that fails early validation
+    // (no file field) → 400. /metrics must show a parse_requests counter
+    // for /v1/extract with status="400", proving record_outcome fires on
+    // every exit path.
+    let (app, api_key, _, _) = test_app_with_key!();
+
+    let boundary = "----NoFileBoundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"schema\"\r\n\r\n");
+    body.extend_from_slice(br#"{"type":"object"}"#);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let req = test::TestRequest::post()
+        .uri("/v1/extract")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400, "missing file must 400");
+
+    // Scrape /metrics and assert the /v1/extract 400 counter incremented.
+    let req = test::TestRequest::get().uri("/metrics").to_request();
+    let resp = test::call_service(&app, req).await;
+    let body = test::read_body(resp).await;
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("parse_requests_total{endpoint=\"/v1/extract\",status=\"400\"}"),
+        "extract early-error path must increment metrics; got:\n{text}"
+    );
+    // And the latency histogram must have observed it under backend=none.
+    assert!(
+        text.contains("parse_duration_seconds_count{backend=\"none\"}"),
+        "extract early-error path must record histogram under backend=none; got:\n{text}"
+    );
+}
+
+#[actix_rt::test]
 async fn test_extract_returns_502_when_stub_data_violates_schema() {
     // Stub mode returns `data: {}`. A schema requiring `invoice_number`
     // → empty object fails validation → 502 SCHEMA_VALIDATION_FAILED.

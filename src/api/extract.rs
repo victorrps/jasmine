@@ -13,6 +13,7 @@ use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
 use crate::services::metrics::Metrics;
 use crate::services::parse_gate::ParseGate;
 use crate::services::{ocr, pdf_parser, schema_extractor};
+use actix_web::ResponseError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,12 @@ pub async fn extract_pdf(
     })?;
     // Atomic inc + drop guard — see GateGaugeGuard::new in parse.rs.
     let _gate_guard = crate::api::parse::GateGaugeGuard::new(metrics.clone());
+
+    // Inner async block runs the full extract pipeline. Every exit path
+    // — early validation, parse dispatch, schema-extract, schema
+    // validation, success — goes through the single `record_outcome`
+    // call below so /metrics reflects reality on every request.
+    let outcome: Result<(ExtractResponse, Option<pdf_parser::RoutedTo>), AppError> = async {
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
         return Err(AppError::QuotaExceeded(format!(
@@ -181,57 +188,75 @@ pub async fn extract_pdf(
     // surprise than failing loudly.
     if let Err(detail) = validate_against_schema(&extracted.data, &schema) {
         metrics.extract_validation_failures.inc();
-        crate::api::parse::record_outcome(
-            &metrics,
-            "/v1/extract",
-            "502",
-            parse_result.document.metadata.routed_to,
-            started,
-        );
         return Err(AppError::SchemaValidationFailed(detail));
     }
-    crate::api::parse::record_outcome(
-        &metrics,
-        "/v1/extract",
-        "200",
-        parse_result.document.metadata.routed_to,
-        started,
-    );
 
-    // Log usage asynchronously
-    let pool_clone = pool.get_ref().clone();
-    let key_id = auth.api_key_id.clone();
-    let rid = req_id.id.clone();
-    let pages = parse_result.usage.pages_processed;
-    let credits = parse_result.usage.credits_used;
-    let ms = parse_result.document.metadata.processing_ms;
-    tokio::spawn(async move {
-        if let Err(e) = models::usage_log::log_usage(
-            &pool_clone,
-            &key_id,
-            "/v1/extract",
-            pages,
-            credits,
-            ms,
-            &rid,
-        )
-        .await
-        {
-            tracing::error!(
-                error = %e,
-                api_key_id = %key_id,
-                request_id = %rid,
-                "failed to write usage log for /v1/extract — billing audit gap"
+    let backend = parse_result.document.metadata.routed_to;
+    Ok((
+        ExtractResponse {
+            document: parse_result.document,
+            extracted,
+            usage: parse_result.usage,
+            request_id: req_id.id.clone(),
+        },
+        backend,
+    ))
+    }
+    .await;
+
+    match outcome {
+        Ok((body, backend)) => {
+            crate::api::parse::record_outcome(
+                &metrics,
+                "/v1/extract",
+                "200",
+                backend,
+                started,
             );
+            // Log usage asynchronously — successful extractions only.
+            let pool_clone = pool.get_ref().clone();
+            let key_id = auth.api_key_id.clone();
+            let rid = req_id.id.clone();
+            let pages = body.usage.pages_processed;
+            let credits = body.usage.credits_used;
+            let ms = body.document.metadata.processing_ms;
+            tokio::spawn(async move {
+                if let Err(e) = models::usage_log::log_usage(
+                    &pool_clone,
+                    &key_id,
+                    "/v1/extract",
+                    pages,
+                    credits,
+                    ms,
+                    &rid,
+                )
+                .await
+                {
+                    tracing::error!(
+                        error = %e,
+                        api_key_id = %key_id,
+                        request_id = %rid,
+                        "failed to write usage log for /v1/extract — billing audit gap"
+                    );
+                }
+            });
+            Ok(HttpResponse::Ok().json(body))
         }
-    });
-
-    Ok(HttpResponse::Ok().json(ExtractResponse {
-        document: parse_result.document,
-        extracted,
-        usage: parse_result.usage,
-        request_id: req_id.id.clone(),
-    }))
+        Err(e) => {
+            // Derive the status label from the error's HTTP status so the
+            // metric matches what the client actually sees. No backend
+            // label — early-exit errors did not route to a backend.
+            let status_label = e.status_code().as_u16().to_string();
+            crate::api::parse::record_outcome(
+                &metrics,
+                "/v1/extract",
+                &status_label,
+                None,
+                started,
+            );
+            Err(e)
+        }
+    }
 }
 
 /// Validate `data` against the customer-supplied JSON Schema. Compiles
