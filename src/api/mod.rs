@@ -3,4 +3,5 @@ pub mod billing;
 pub mod extract;
 pub mod health;
 pub mod mcp;
+pub mod metrics;
 pub mod parse;

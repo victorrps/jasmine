@@ -8,11 +8,18 @@ pub struct ErrorResponse {
 }
 
 /// Error body with a stable code, safe message, and correlation ID.
+///
+/// `retryable` tells the caller whether retrying the same request is
+/// likely to succeed. Transient infra errors (502/503/504/500) are
+/// retryable; client-fault errors (400/401/403/404/422) are not. SDKs
+/// can use this flag to drive automatic retry-with-backoff without
+/// re-encoding the HTTP-status taxonomy.
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
     pub request_id: String,
+    pub retryable: bool,
 }
 
 /// Application error type. Maps to HTTP status codes and stable error codes.
@@ -155,6 +162,36 @@ impl AppError {
         }
     }
 
+    /// Whether the error is transient — i.e. retrying the same request
+    /// is likely to succeed eventually. Used to populate `retryable` in
+    /// the response envelope so SDKs can drive retry-with-backoff.
+    pub fn retryable(&self) -> bool {
+        match self {
+            // Transient infrastructure errors
+            Self::DeadlineExceeded
+            | Self::ServiceBusy
+            | Self::Internal(_)
+            | Self::Database(_)
+            | Self::UpstreamApi(_) => true,
+
+            // Permanent client-fault errors
+            Self::InvalidCredentials
+            | Self::InvalidToken
+            | Self::InvalidApiKey
+            | Self::Validation(_)
+            | Self::Conflict(_)
+            | Self::NotFound
+            | Self::FileTooLarge
+            | Self::InvalidPdf
+            | Self::PdfProcessing(_)
+            | Self::QuotaExceeded(_)
+            | Self::NotImplemented(_)
+            | Self::EncryptedPdf
+            | Self::SchemaValidationFailed(_)
+            | Self::ExtractInputTooLarge { .. } => false,
+        }
+    }
+
     /// Build the HTTP response for this error with the given request ID.
     pub fn to_response(&self, request_id: &str) -> HttpResponse {
         let body = ErrorResponse {
@@ -162,6 +199,7 @@ impl AppError {
                 code: self.code().into(),
                 message: self.safe_message(),
                 request_id: request_id.into(),
+                retryable: self.retryable(),
             },
         };
         let mut builder = HttpResponse::build(self.status());
@@ -293,6 +331,41 @@ mod tests {
             err.safe_message().contains("path /foo"),
             "validation detail must be forwarded to caller"
         );
+    }
+
+    #[test]
+    fn retryable_flag_true_for_transient_errors() {
+        assert!(AppError::DeadlineExceeded.retryable());
+        assert!(AppError::ServiceBusy.retryable());
+        assert!(AppError::Internal("x".into()).retryable());
+        assert!(AppError::UpstreamApi("x".into()).retryable());
+    }
+
+    #[test]
+    fn retryable_flag_false_for_client_errors() {
+        assert!(!AppError::InvalidPdf.retryable());
+        assert!(!AppError::EncryptedPdf.retryable());
+        assert!(!AppError::Validation("x".into()).retryable());
+        assert!(!AppError::QuotaExceeded("x".into()).retryable());
+        assert!(!AppError::ExtractInputTooLarge { actual: 1, limit: 0 }.retryable());
+        assert!(!AppError::SchemaValidationFailed("x".into()).retryable());
+    }
+
+    #[actix_rt::test]
+    async fn error_response_body_includes_retryable_flag() {
+        let resp = AppError::ServiceBusy.to_response("req_test");
+        let bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["retryable"], true);
+        assert_eq!(json["error"]["code"], "SERVICE_BUSY");
+    }
+
+    #[actix_rt::test]
+    async fn error_response_body_marks_client_error_non_retryable() {
+        let resp = AppError::InvalidPdf.to_response("req_test");
+        let bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["retryable"], false);
     }
 
     #[test]

@@ -34,12 +34,16 @@ async fn main() -> anyhow::Result<()> {
     let governor_cfg = middleware::rate_limit::build_governor(config.rate_limit_per_minute);
     let auth_governor_cfg = middleware::rate_limit::build_auth_governor();
     let parse_gate = services::parse_gate::ParseGate::new(config.max_concurrent_parses);
+    let metrics = services::metrics::Metrics::new();
+    let idempotency_cache = services::idempotency::IdempotencyCache::with_defaults();
 
     let bind_addr = format!("{}:{}", config.host, config.port);
     let config_data = web::Data::new(config);
     let pool_data = web::Data::new(pool);
     let start_data = web::Data::new(start_time);
     let gate_data = web::Data::new(parse_gate);
+    let metrics_data = web::Data::new(metrics);
+    let idem_data = web::Data::new(idempotency_cache);
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -64,9 +68,12 @@ async fn main() -> anyhow::Result<()> {
             .app_data(pool_data.clone())
             .app_data(start_data.clone())
             .app_data(gate_data.clone())
+            .app_data(metrics_data.clone())
+            .app_data(idem_data.clone())
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
-            // Health
+            // Health + metrics (unauthenticated; protect via network policy)
             .route("/health", web::get().to(api::health::health))
+            .route("/metrics", web::get().to(api::metrics::metrics))
             // Auth (tighter rate limit: 5 req/min per IP)
             .service(
                 web::scope("/auth")

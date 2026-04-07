@@ -10,10 +10,11 @@ use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
 use crate::models;
 use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
+use crate::services::metrics::Metrics;
 use crate::services::parse_gate::ParseGate;
 use crate::services::{ocr, pdf_parser, schema_extractor};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
 const MAX_SCHEMA_SIZE: usize = 64 * 1024; // 64 KB
@@ -29,16 +30,23 @@ pub struct ExtractResponse {
 }
 
 /// POST /v1/extract — upload a PDF + JSON schema, return structured data.
-#[tracing::instrument(skip(auth, payload, pool, config, gate, req_id))]
+#[tracing::instrument(skip(auth, payload, pool, config, gate, metrics, req_id))]
 pub async fn extract_pdf(
     auth: ApiKeyAuth,
     mut payload: Multipart,
     pool: web::Data<SqlitePool>,
     config: web::Data<AppConfig>,
     gate: web::Data<ParseGate>,
+    metrics: web::Data<Metrics>,
     req_id: web::ReqData<RequestId>,
 ) -> Result<HttpResponse, AppError> {
-    let _permit = gate.try_acquire().map_err(|_| AppError::ServiceBusy)?;
+    let started = Instant::now();
+    let _permit = gate.try_acquire().map_err(|_| {
+        crate::api::parse::record_outcome(&metrics, "/v1/extract", "503", None, started);
+        AppError::ServiceBusy
+    })?;
+    metrics.parse_gate_in_flight.inc();
+    let _gate_guard = crate::api::parse::GateGaugeGuard(metrics.clone());
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
         return Err(AppError::QuotaExceeded(format!(
@@ -172,8 +180,23 @@ pub async fn extract_pdf(
     // schema. Returning data that doesn't validate is a worse customer
     // surprise than failing loudly.
     if let Err(detail) = validate_against_schema(&extracted.data, &schema) {
+        metrics.extract_validation_failures.inc();
+        crate::api::parse::record_outcome(
+            &metrics,
+            "/v1/extract",
+            "502",
+            parse_result.document.metadata.routed_to,
+            started,
+        );
         return Err(AppError::SchemaValidationFailed(detail));
     }
+    crate::api::parse::record_outcome(
+        &metrics,
+        "/v1/extract",
+        "200",
+        parse_result.document.metadata.routed_to,
+        started,
+    );
 
     // Log usage asynchronously
     let pool_clone = pool.get_ref().clone();

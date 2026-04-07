@@ -1,6 +1,8 @@
 pub mod billing;
 pub mod doc_type_detector;
+pub mod idempotency;
 pub mod markdown_cleaner;
+pub mod metrics;
 pub mod ocr;
 pub mod paddle_ocr;
 pub mod parse_gate;

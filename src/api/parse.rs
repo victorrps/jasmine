@@ -10,10 +10,13 @@ use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
 use crate::models;
 use crate::services::doc_type_detector::{DocType, MAX_HINT_BYTES};
+use crate::services::idempotency::{CachedResponse, IdempotencyCache, MAX_KEY_LEN};
+use crate::services::metrics::{BackendLabels, Metrics, ParseLabels};
 use crate::services::parse_gate::ParseGate;
 use crate::services::{ocr, pdf_parser};
+use actix_web::HttpRequest;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const PDF_MAGIC: &[u8] = b"%PDF-";
@@ -27,21 +30,44 @@ pub struct ParseResponse {
 }
 
 /// POST /v1/parse — upload a PDF and receive structured output.
-#[tracing::instrument(skip(auth, payload, pool, config, gate, req_id))]
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(auth, http_req, payload, pool, config, gate, metrics, idem, req_id))]
 pub async fn parse_pdf(
     auth: ApiKeyAuth,
+    http_req: HttpRequest,
     mut payload: Multipart,
     pool: web::Data<SqlitePool>,
     config: web::Data<AppConfig>,
     gate: web::Data<ParseGate>,
+    metrics: web::Data<Metrics>,
+    idem: web::Data<IdempotencyCache>,
     req_id: web::ReqData<RequestId>,
 ) -> Result<HttpResponse, AppError> {
+    let started = Instant::now();
+
+    // Idempotency replay short-circuit. Skipped entirely if the header
+    // is absent. Replays do NOT consume a gate permit, do NOT log
+    // usage, and do NOT bill — they just return the cached body.
+    let idem_key = read_idempotency_key(&http_req)?;
+    let idem_cache_key = idem_key
+        .as_ref()
+        .map(|k| IdempotencyCache::make_key(&auth.api_key_id, k));
+    if let Some(ref cache_key) = idem_cache_key {
+        if let Some(cached) = idem.get(cache_key) {
+            return Ok(replay_cached(cached));
+        }
+    }
     // Acquire a concurrency permit BEFORE the billing check or any
     // expensive work. The permit is held until the dispatcher returns
     // (the `_permit` binding lives for the function scope), so even if
     // the deadline drops the inner future the gate keeps reflecting
     // real in-flight work.
-    let _permit = gate.try_acquire().map_err(|_| AppError::ServiceBusy)?;
+    let _permit = gate.try_acquire().map_err(|_| {
+        record_outcome(&metrics, "/v1/parse", "503", None, started);
+        AppError::ServiceBusy
+    })?;
+    metrics.parse_gate_in_flight.inc();
+    let _gate_guard = GateGaugeGuard(metrics.clone());
 
     let status = crate::services::billing::check_usage_limit(pool.get_ref(), &auth.api_key_id).await?;
     if !status.allowed {
@@ -63,7 +89,7 @@ pub async fn parse_pdf(
             config.paddleocr_timeout_secs,
         )
     });
-    let result = pdf_parser::parse_pdf_with_backends_mode(
+    let result = match pdf_parser::parse_pdf_with_backends_mode(
         bytes,
         &ocr_config,
         paddle_config.as_ref(),
@@ -71,7 +97,44 @@ pub async fn parse_pdf(
         document_type_hint,
         Duration::from_secs(config.parse_deadline_secs),
     )
-    .await?;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let status = match &e {
+                AppError::DeadlineExceeded => "504",
+                AppError::EncryptedPdf => "422",
+                AppError::InvalidPdf => "400",
+                AppError::QuotaExceeded(_) => "429",
+                _ => "500",
+            };
+            record_outcome(&metrics, "/v1/parse", status, None, started);
+            return Err(e);
+        }
+    };
+    record_outcome(
+        &metrics,
+        "/v1/parse",
+        "200",
+        result.document.metadata.routed_to,
+        started,
+    );
+    if result
+        .document
+        .metadata
+        .warnings
+        .contains(&pdf_parser::ParseWarning::PaddleDegradedToTesseract)
+    {
+        metrics.paddle_degraded.inc();
+    }
+    if let Some(ref class) = result.document.metadata.classification {
+        metrics
+            .classifier_class
+            .get_or_create(&crate::services::metrics::ClassifierLabels {
+                class: format!("{:?}", class.class).to_lowercase(),
+            })
+            .inc();
+    }
 
     // Log usage asynchronously
     let pool_clone = pool.get_ref().clone();
@@ -101,11 +164,69 @@ pub async fn parse_pdf(
         }
     });
 
-    Ok(HttpResponse::Ok().json(ParseResponse {
+    let body = ParseResponse {
         document: result.document,
         usage: result.usage,
         request_id: req_id.id.clone(),
-    }))
+    };
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+        AppError::Internal(format!("failed to serialize parse response: {e}"))
+    })?;
+
+    if let Some(cache_key) = idem_cache_key {
+        if idem.should_cache(body_bytes.len()) {
+            idem.put(
+                cache_key,
+                CachedResponse {
+                    status: 200,
+                    body: body_bytes.clone(),
+                    content_type: "application/json".into(),
+                    stored_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(body_bytes))
+}
+
+/// Read and validate the optional `Idempotency-Key` header. Returns
+/// `Ok(None)` when absent, `Ok(Some(key))` when present and valid,
+/// `Err(Validation)` when present but malformed (over-length).
+fn read_idempotency_key(req: &HttpRequest) -> Result<Option<String>, AppError> {
+    let Some(raw) = req.headers().get("idempotency-key") else {
+        return Ok(None);
+    };
+    let s = raw
+        .to_str()
+        .map_err(|_| AppError::Validation("Idempotency-Key must be ASCII".into()))?
+        .trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if s.len() > MAX_KEY_LEN {
+        return Err(AppError::Validation(format!(
+            "Idempotency-Key too long ({} > {} chars)",
+            s.len(),
+            MAX_KEY_LEN
+        )));
+    }
+    Ok(Some(s.to_string()))
+}
+
+/// Build an `HttpResponse` from a cached entry, marking the replay
+/// with the `X-Idempotent-Replay: true` header so callers can tell.
+fn replay_cached(cached: CachedResponse) -> HttpResponse {
+    let mut builder = HttpResponse::build(
+        actix_web::http::StatusCode::from_u16(cached.status)
+            .unwrap_or(actix_web::http::StatusCode::OK),
+    );
+    builder
+        .insert_header(("X-Idempotent-Replay", "true"))
+        .content_type(cached.content_type);
+    builder.body(cached.body)
 }
 
 /// Read a parse upload: PDF bytes plus an optional `document_type_hint`
@@ -181,4 +302,47 @@ pub async fn extract_parse_upload(
     // Single Vec → Arc materialization at the boundary. Every downstream
     // consumer takes &PdfBytes / &[u8] and pays only Arc-clone cost.
     Ok((Arc::<[u8]>::from(bytes), hint))
+}
+
+/// RAII helper that decrements `parse_gate_in_flight` when dropped.
+/// Mirrors the lifetime of the semaphore permit so the gauge stays in
+/// sync with the actual in-flight permit count even on early-return
+/// error paths.
+pub(crate) struct GateGaugeGuard(pub web::Data<Metrics>);
+impl Drop for GateGaugeGuard {
+    fn drop(&mut self) {
+        self.0.parse_gate_in_flight.dec();
+    }
+}
+
+/// Record a parse-request outcome in the metrics surface. Always called
+/// once per request — including on the early-return error paths — so
+/// the `parse_requests_total` counter matches reality.
+pub(crate) fn record_outcome(
+    metrics: &Metrics,
+    endpoint: &str,
+    status: &str,
+    backend: Option<pdf_parser::RoutedTo>,
+    started: Instant,
+) {
+    metrics
+        .parse_requests
+        .get_or_create(&ParseLabels {
+            endpoint: endpoint.into(),
+            status: status.into(),
+        })
+        .inc();
+    if let Some(b) = backend {
+        let backend_label = match b {
+            pdf_parser::RoutedTo::PdfOxide => "pdf_oxide",
+            pdf_parser::RoutedTo::Paddle => "paddle",
+            pdf_parser::RoutedTo::Tesseract => "tesseract",
+        };
+        metrics
+            .parse_duration
+            .get_or_create(&BackendLabels {
+                backend: backend_label.into(),
+            })
+            .observe(started.elapsed().as_secs_f64());
+    }
 }

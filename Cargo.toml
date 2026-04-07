@@ -44,6 +44,8 @@ validator = { version = "0.18", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-actix-web = "0.7"
+prometheus-client = "0.22"
+lru = "0.12"
 
 # Utils
 anyhow = "1"

@@ -43,8 +43,11 @@ macro_rules! test_app_with_key {
                 .app_data(web::Data::new(
                     docforge::services::parse_gate::ParseGate::new(8),
                 ))
+                .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
+                .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
                 .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
                 .route("/health", web::get().to(docforge::api::health::health))
+                .route("/metrics", web::get().to(docforge::api::metrics::metrics))
                 .service(
                     web::scope("/auth")
                         .wrap(actix_governor::Governor::new(&auth_gov))
@@ -294,6 +297,106 @@ async fn test_extract_stub() {
 }
 
 #[actix_rt::test]
+async fn test_idempotency_key_returns_cached_response_on_replay() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body1) = build_multipart_pdf(&common::sample_pdf_bytes());
+    let (boundary2, body2) = build_multipart_pdf(&common::sample_pdf_bytes());
+
+    // First call: cache miss → does the work, caches the result.
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header(("Idempotency-Key", "test-idem-001"))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body1)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body_first: serde_json::Value = test::read_body_json(resp).await;
+
+    // Second call with same key → cache hit, X-Idempotent-Replay header.
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header(("Idempotency-Key", "test-idem-001"))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary2}"),
+        ))
+        .set_payload(body2)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let replay_header = resp
+        .headers()
+        .get("x-idempotent-replay")
+        .expect("replay must set X-Idempotent-Replay header")
+        .to_str()
+        .unwrap();
+    assert_eq!(replay_header, "true");
+    let body_second: serde_json::Value = test::read_body_json(resp).await;
+
+    // The second body must equal the first verbatim, including
+    // request_id (which is the whole point of an idempotent replay).
+    assert_eq!(body_first, body_second, "replayed body must match original");
+}
+
+#[actix_rt::test]
+async fn test_idempotency_key_too_long_returns_400() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body) = build_multipart_pdf(&common::sample_pdf_bytes());
+    let too_long = "x".repeat(200);
+
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header(("Idempotency-Key", too_long.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[actix_rt::test]
+async fn test_metrics_endpoint_serves_text_format_with_counters_after_parse() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body) = build_multipart_pdf(&common::sample_pdf_bytes());
+
+    // Drive a successful parse first so the parse_requests counter
+    // has a value to assert on.
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    // Now scrape /metrics and assert counter shape.
+    let req = test::TestRequest::get().uri("/metrics").to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body = test::read_body(resp).await;
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(text.contains("parse_requests"), "got: {text}");
+    assert!(
+        text.contains("parse_requests_total{endpoint=\"/v1/parse\",status=\"200\"}"),
+        "successful parse must increment 200 counter; got: {text}"
+    );
+}
+
+#[actix_rt::test]
 async fn test_extract_returns_502_when_stub_data_violates_schema() {
     // Stub mode returns `data: {}`. A schema requiring `invoice_number`
     // → empty object fails validation → 502 SCHEMA_VALIDATION_FAILED.
@@ -370,6 +473,8 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
             .app_data(web::Data::new(
                 docforge::services::parse_gate::ParseGate::new(8),
             ))
+            .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
+                .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
                 web::scope("/auth")
@@ -539,6 +644,8 @@ async fn test_parse_returns_503_when_gate_saturated() {
             .app_data(web::Data::new(pool))
             .app_data(web::Data::new(Instant::now()))
             .app_data(web::Data::new(gate))
+            .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
+                .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
                 web::scope("/auth")

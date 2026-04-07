@@ -70,6 +70,8 @@ async fn auto_mode_routes_structured_doc_through_paddle_end_to_end() {
             .app_data(web::Data::new(config))
             .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
+                .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
+                .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
             .app_data(web::Data::new(Instant::now()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
