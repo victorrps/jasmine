@@ -25,11 +25,6 @@ pub struct ErrorBody {
 /// Application error type. Maps to HTTP status codes and stable error codes.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    // TODO(piece-6): remove with the JwtAuth/jwt.rs cleanup.
-    #[allow(dead_code)]
-    #[error("Invalid credentials")]
-    InvalidCredentials,
-
     #[error("Token expired or malformed")]
     InvalidToken,
 
@@ -103,7 +98,6 @@ impl AppError {
     /// Stable error code string for the API response.
     fn code(&self) -> &str {
         match self {
-            Self::InvalidCredentials => "INVALID_CREDENTIALS",
             Self::InvalidToken => "INVALID_TOKEN",
             Self::InvalidApiKey => "INVALID_API_KEY",
             Self::Validation(_) => "VALIDATION_ERROR",
@@ -127,7 +121,6 @@ impl AppError {
 
     fn status(&self) -> StatusCode {
         match self {
-            Self::InvalidCredentials => StatusCode::UNAUTHORIZED,
             Self::InvalidToken => StatusCode::UNAUTHORIZED,
             Self::InvalidApiKey => StatusCode::UNAUTHORIZED,
             Self::Validation(_) => StatusCode::BAD_REQUEST,
@@ -188,8 +181,7 @@ impl AppError {
             | Self::PdfProcessing(_) => true,
 
             // Permanent client-fault errors
-            Self::InvalidCredentials
-            | Self::InvalidToken
+            Self::InvalidToken
             | Self::InvalidApiKey
             | Self::Validation(_)
             | Self::Conflict(_)
@@ -238,11 +230,6 @@ mod tests {
     use super::*;
 
     // ── Error code mapping ────────────────────────────────────────────────────
-
-    #[test]
-    fn invalid_credentials_maps_to_correct_code() {
-        assert_eq!(AppError::InvalidCredentials.code(), "INVALID_CREDENTIALS");
-    }
 
     #[test]
     fn invalid_token_maps_to_correct_code() {
@@ -405,14 +392,6 @@ mod tests {
     // ── HTTP status code mapping ──────────────────────────────────────────────
 
     #[test]
-    fn invalid_credentials_returns_401() {
-        assert_eq!(
-            AppError::InvalidCredentials.status(),
-            StatusCode::UNAUTHORIZED
-        );
-    }
-
-    #[test]
     fn invalid_token_returns_401() {
         assert_eq!(AppError::InvalidToken.status(), StatusCode::UNAUTHORIZED);
     }
@@ -560,7 +539,7 @@ mod tests {
     #[test]
     fn to_response_uses_empty_request_id_when_not_available() {
         // error_response() (via ResponseError) passes "" — must not panic
-        let err = AppError::InvalidCredentials;
+        let err = AppError::InvalidToken;
         let resp = err.to_response("");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }

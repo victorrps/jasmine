@@ -39,8 +39,6 @@ async fn parse_endpoint_uses_live_paddle_sidecar() {
             "sqlite://file:test_paddle_e2e_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         ),
-        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-        jwt_expiry_minutes: 15,
         rate_limit_per_minute: 1000,
         api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
         anthropic_api_key: None,
@@ -57,17 +55,14 @@ async fn parse_endpoint_uses_live_paddle_sidecar() {
             clerk_jwks_url: None,
             clerk_issuer: None,
             clerk_leeway_secs: 30,
-            dev_auth_bypass: false,
+            dev_auth_bypass: true,
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
-    // Seed user via the Clerk upsert path; mint a JWT for the local
-    // users.id PK since /api-keys still uses JwtAuth (piece-6 cutover).
     let clerk_id = format!("user_{}", uuid::Uuid::new_v4().simple());
-    let user = docforge::models::user::upsert_from_clerk(
+    docforge::models::user::upsert_from_clerk(
         &pool, &clerk_id, "paddle@test.com", Some("Test"), None,
     ).await.unwrap();
-    let jwt = docforge::auth::jwt::create_token(&user.id, &config.jwt_secret, 15).unwrap();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -79,6 +74,15 @@ async fn parse_endpoint_uses_live_paddle_sidecar() {
                 .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
                 .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
                 .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::Data::new(docforge::auth::clerk::ClerkConfig {
+                jwks_url: String::new(),
+                issuer: String::new(),
+                leeway_secs: 30,
+                dev_auth_bypass: true,
+            }))
+            .app_data(web::Data::new(
+                docforge::auth::clerk::JwksCache::new(String::new()).unwrap(),
+            ))
             .app_data(web::Data::new(Instant::now()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
@@ -95,7 +99,7 @@ async fn parse_endpoint_uses_live_paddle_sidecar() {
     // Create API key
     let req = test::TestRequest::post()
         .uri("/api-keys")
-        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
         .set_json(serde_json::json!({"name":"PaddleE2E"}))
         .to_request();
     let resp = test::call_service(&app, req).await;

@@ -86,6 +86,29 @@ pub async fn upsert_from_clerk(
     })
 }
 
+/// Resolve a Clerk user ID to the local `users.id` PK, optionally
+/// auto-provisioning a stub row in dev-bypass mode.
+///
+/// `dev_auto_provision` MUST only be `true` when the deployment is in
+/// dev-bypass mode (`DEV_AUTH_BYPASS=true && CLERK_JWKS_URL` unset).
+/// Callers compute that boolean from `ClerkConfig` so the invariant
+/// stays in one place.
+pub async fn get_local_id_by_clerk_id(
+    pool: &SqlitePool,
+    clerk_user_id: &str,
+    dev_auto_provision: bool,
+) -> Result<String, AppError> {
+    if let Some(user) = find_by_clerk_id(pool, clerk_user_id).await? {
+        return Ok(user.id);
+    }
+    if dev_auto_provision {
+        let email = format!("{clerk_user_id}@dev.local");
+        let user = upsert_from_clerk(pool, clerk_user_id, &email, None, None).await?;
+        return Ok(user.id);
+    }
+    Err(AppError::NotFound)
+}
+
 /// Hard-delete a user by Clerk ID, cleaning up dependent rows.
 ///
 /// `api_keys` has `ON DELETE CASCADE` on `user_id`, but `usage_logs`

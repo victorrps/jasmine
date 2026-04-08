@@ -31,9 +31,24 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+def _write_prewarm_image(path: Path) -> None:
+    """Write a small valid PNG for pre-warming. Uses Pillow (already a
+    paddleocr transitive dep) instead of a hard-coded byte blob so we
+    cannot trip a CRC mismatch on a hand-typed hex literal.
+
+    The image is intentionally a solid 64x64 white square — large
+    enough for the layout detector to run its preprocessing path
+    without triggering size-guard branches on 1x1 inputs.
+    """
+    from PIL import Image  # lazy import
+
+    Image.new("RGB", (64, 64), color=(255, 255, 255)).save(path, format="PNG")
 
 logging.basicConfig(
     level=os.environ.get("PADDLE_LOG_LEVEL", "INFO"),
@@ -50,11 +65,16 @@ _pipeline: Any | None = None
 def get_pipeline() -> Any:
     global _pipeline
     if _pipeline is None:
-        log.info("loading PPStructureV3 pipeline (first request)...")
+        # `PADDLE_DEVICE` selects the inference backend per the
+        # PP-StructureV3 docs (§2.2). Accepted values: "cpu",
+        # "gpu", "gpu:0", "gpu:1", "npu", "xpu", "mlu". Default
+        # stays "cpu" so a fresh checkout works without CUDA.
+        device = os.environ.get("PADDLE_DEVICE", "cpu").strip() or "cpu"
+        log.info("loading PPStructureV3 pipeline on device=%s (first request)...", device)
         from paddleocr import PPStructureV3  # imported lazily so --help is fast
 
-        _pipeline = PPStructureV3()
-        log.info("PPStructureV3 ready")
+        _pipeline = PPStructureV3(device=device)
+        log.info("PPStructureV3 ready (device=%s)", device)
     return _pipeline
 
 
@@ -71,8 +91,61 @@ def error(code: int, msg: str, status: int = 400) -> JSONResponse:
     )
 
 
+def _prewarm() -> None:
+    """Run a single throwaway predict() to compile JIT kernels and load
+    GPU/CPU model weights into RAM. Skipped if `PADDLE_PREWARM=0`.
+
+    Cold-start tax for PP-StructureV3 is dominated by CUDA kernel
+    compilation and model deserialization on the first predict() call,
+    not by `PPStructureV3()` construction. Pre-warming with a 1x1 PNG
+    pays that cost during boot instead of on the first user request,
+    where it would burn most of the request deadline budget.
+    """
+    # Milestones go through print(flush=True) instead of the logging
+    # stack. Uvicorn installs its own dictConfig on startup which can
+    # silently drop INFO-level records routed through the root logger
+    # set up by our module-level basicConfig, so the user sees no
+    # prewarm output at all. Printing to stdout is unconditional and
+    # lines up with uvicorn's own startup banner.
+    import sys
+
+    def say(msg: str) -> None:
+        print(f"[paddle-server] {msg}", file=sys.stdout, flush=True)
+
+    if os.environ.get("PADDLE_PREWARM", "1") == "0":
+        say("prewarm: skipped (PADDLE_PREWARM=0)")
+        return
+    try:
+        import time
+
+        t0 = time.time()
+        say("prewarm: loading PPStructureV3 pipeline (this may take 40-80s on GPU cold)...")
+        pipeline = get_pipeline()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        _write_prewarm_image(tmp_path)
+        try:
+            # Materialize the generator so kernels actually run, not
+            # just get scheduled.
+            say("prewarm: running throwaway predict() to compile kernels...")
+            list(pipeline.predict(input=str(tmp_path)))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        say(f"prewarm: complete in {time.time() - t0:.2f}s")
+    except Exception:
+        # Pre-warm failures must not block startup — the first real
+        # request will simply pay the tax instead.
+        log.exception("prewarm: failed (sidecar will still serve, first request pays cold start)")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _prewarm()
+    yield
+
+
 # ── App ─────────────────────────────────────────────────────────────────────
-app = FastAPI(title="DocForge PaddleOCR sidecar", version="0.1.0")
+app = FastAPI(title="DocForge PaddleOCR sidecar", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")

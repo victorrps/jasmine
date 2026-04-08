@@ -22,9 +22,18 @@ source "$VENV/bin/activate"
 
 HOST="${PADDLE_HOST:-127.0.0.1}"
 PORT="${PADDLE_PORT:-8868}"
+# Forwarded to paddle_server.py → PPStructureV3(device=...). Default
+# stays "cpu"; set PADDLE_DEVICE=gpu (or gpu:0) after running
+# `PADDLE_DEVICE=gpu ./scripts/setup_paddle.sh`.
+export PADDLE_DEVICE="${PADDLE_DEVICE:-cpu}"
 
-echo "[paddle-server] listening on http://$HOST:$PORT"
-echo "[paddle-server] first request will load the PPStructureV3 model (5-15s)"
+echo "[paddle-server] listening on http://$HOST:$PORT (device=$PADDLE_DEVICE)"
+echo "[paddle-server] first request will load the PPStructureV3 model"
+if [[ "$PADDLE_DEVICE" == cpu ]]; then
+  echo "[paddle-server] (CPU load: 5-15s)"
+else
+  echo "[paddle-server] (GPU load: faster steady-state, ~10-20s warm-up)"
+fi
 
 cd "$REPO_ROOT"
 exec python -m uvicorn scripts.paddle_server:app \

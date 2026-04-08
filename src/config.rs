@@ -7,10 +7,6 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub database_url: String,
-    pub jwt_secret: String,
-    // TODO(piece-6): drop with jwt.rs once /api-keys handlers move to ClerkAuth.
-    #[allow(dead_code)]
-    pub jwt_expiry_minutes: u64,
     pub rate_limit_per_minute: u64,
     /// Server-side HMAC key for API key hashing. Prevents offline brute-force if DB is leaked.
     pub api_key_pepper: String,
@@ -122,20 +118,10 @@ impl AppConfig {
     pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self> {
         let get = |key: &str| -> Option<String> { vars.get(key).cloned() };
 
-        let jwt_secret = get("JWT_SECRET").with_context(|| "JWT_SECRET must be set")?;
-        if jwt_secret.len() < 32 {
-            anyhow::bail!("JWT_SECRET must be at least 32 characters");
-        }
-
         let port_str = get("PORT").unwrap_or_else(|| "8080".into());
         let port: u16 = port_str.parse().context("PORT must be a valid u16")?;
 
         let database_url = get("DATABASE_URL").with_context(|| "DATABASE_URL must be set")?;
-
-        let jwt_expiry_minutes: u64 = get("JWT_EXPIRY_MINUTES")
-            .unwrap_or_else(|| "15".into())
-            .parse()
-            .context("JWT_EXPIRY_MINUTES must be a valid u64")?;
 
         let rate_limit_per_minute: u64 = get("RATE_LIMIT_PER_MINUTE")
             .unwrap_or_else(|| "60".into())
@@ -253,8 +239,6 @@ impl AppConfig {
             host: get("HOST").unwrap_or_else(|| "127.0.0.1".into()),
             port,
             database_url,
-            jwt_secret,
-            jwt_expiry_minutes,
             rate_limit_per_minute,
             api_key_pepper,
             anthropic_api_key,
@@ -281,14 +265,12 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    const VALID_SECRET: &str = "a_valid_secret_that_is_at_least_32_chars";
     const VALID_PEPPER: &str = "a_valid_pepper_that_is_at_least_32_chars";
     const VALID_DB: &str = "sqlite://:memory:";
 
     /// Build a minimal valid vars map for `from_vars`.
     fn base_vars() -> HashMap<String, String> {
         let mut m = HashMap::new();
-        m.insert("JWT_SECRET".into(), VALID_SECRET.into());
         m.insert("API_KEY_PEPPER".into(), VALID_PEPPER.into());
         m.insert("DATABASE_URL".into(), VALID_DB.into());
         m
@@ -314,7 +296,6 @@ mod tests {
     fn from_vars_succeeds_with_required_vars() {
         let vars = base_vars();
         let cfg = AppConfig::from_vars(&vars).expect("must succeed with required vars");
-        assert_eq!(cfg.jwt_secret, VALID_SECRET);
         assert_eq!(cfg.database_url, VALID_DB);
     }
 
@@ -349,21 +330,6 @@ mod tests {
     }
 
     #[test]
-    fn from_vars_uses_default_jwt_expiry_when_absent() {
-        let vars = base_vars();
-        let cfg = AppConfig::from_vars(&vars).unwrap();
-        assert_eq!(cfg.jwt_expiry_minutes, 15);
-    }
-
-    #[test]
-    fn from_vars_uses_custom_jwt_expiry() {
-        let mut vars = base_vars();
-        vars.insert("JWT_EXPIRY_MINUTES".into(), "60".into());
-        let cfg = AppConfig::from_vars(&vars).unwrap();
-        assert_eq!(cfg.jwt_expiry_minutes, 60);
-    }
-
-    #[test]
     fn from_vars_uses_default_rate_limit_when_absent() {
         let vars = base_vars();
         let cfg = AppConfig::from_vars(&vars).unwrap();
@@ -376,42 +342,6 @@ mod tests {
         vars.insert("RATE_LIMIT_PER_MINUTE".into(), "120".into());
         let cfg = AppConfig::from_vars(&vars).unwrap();
         assert_eq!(cfg.rate_limit_per_minute, 120);
-    }
-
-    #[test]
-    fn from_vars_fails_when_jwt_secret_missing() {
-        let mut vars = base_vars();
-        vars.remove("JWT_SECRET");
-        let result = AppConfig::from_vars(&vars);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("JWT_SECRET"),
-            "error should mention JWT_SECRET, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn from_vars_fails_when_jwt_secret_too_short() {
-        let mut vars = base_vars();
-        vars.insert("JWT_SECRET".into(), "tooshort".into());
-        let result = AppConfig::from_vars(&vars);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("32"),
-            "error should mention 32 chars, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn from_vars_jwt_secret_exactly_32_chars_is_valid() {
-        let secret = "12345678901234567890123456789012"; // exactly 32 chars
-        assert_eq!(secret.len(), 32);
-        let mut vars = base_vars();
-        vars.insert("JWT_SECRET".into(), secret.into());
-        let result = AppConfig::from_vars(&vars);
-        assert!(result.is_ok(), "32-char secret must be accepted");
     }
 
     #[test]
@@ -459,18 +389,6 @@ mod tests {
             AppConfig::from_vars(&vars).is_ok(),
             "port 65535 must be valid"
         );
-    }
-
-    #[test]
-    fn from_vars_fails_on_invalid_jwt_expiry_minutes() {
-        let mut vars = base_vars();
-        vars.insert("JWT_EXPIRY_MINUTES".into(), "abc".into());
-        let result = AppConfig::from_vars(&vars);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("JWT_EXPIRY_MINUTES"));
     }
 
     #[test]

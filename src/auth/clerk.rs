@@ -31,12 +31,6 @@
 //! public key, sign tokens locally with the matching private key, and
 //! assert each verification path. **No network access in unit tests.**
 
-// TODO(piece-6): remove this allow once `ClerkAuth` replaces `JwtAuth`
-// on the user-facing handlers (`/api-keys`, `/billing/*`, `/me`). Until
-// then the module is fully tested but not yet referenced from the
-// binary, so dead-code analysis flags every public item.
-#![allow(dead_code)]
-
 use actix_web::{dev::Payload, web, FromRequest, HttpRequest};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -51,6 +45,7 @@ use crate::errors::AppError;
 /// short-lived (~60s) so we keep this small. 30s is enough to absorb
 /// realistic clock drift between our server, the customer's browser,
 /// and Clerk's edge.
+#[allow(dead_code)]
 pub const DEFAULT_LEEWAY_SECS: u64 = 30;
 
 /// Minimum interval between JWKS refresh fetches. Bounds the rate at

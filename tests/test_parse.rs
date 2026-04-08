@@ -5,16 +5,25 @@ use docforge::config::AppConfig;
 use docforge::db;
 use std::time::Instant;
 
-/// Seed a Clerk-mirrored user and mint a JWT for the local users.id.
-/// Returns just the JWT string — callers that already have a pool
-/// and a config drop in this two-liner instead of the old HTTP
-/// register/login dance.
-async fn seed_jwt(pool: &sqlx::SqlitePool, jwt_secret: &str, email: &str) -> String {
+/// Seed a Clerk-mirrored user and return their `clerk_user_id`. The
+/// dev-bypass branch of `ClerkAuth` accepts that string verbatim via
+/// the `X-Dev-User-Id` header, so tests can authenticate without
+/// minting a real Clerk JWT.
+async fn seed_clerk_user(pool: &sqlx::SqlitePool, email: &str) -> String {
     let clerk_id = format!("user_{}", uuid::Uuid::new_v4().simple());
-    let user = docforge::models::user::upsert_from_clerk(pool, &clerk_id, email, Some("Test"), None)
+    docforge::models::user::upsert_from_clerk(pool, &clerk_id, email, Some("Test"), None)
         .await
         .unwrap();
-    docforge::auth::jwt::create_token(&user.id, jwt_secret, 15).unwrap()
+    clerk_id
+}
+
+fn dev_clerk_config() -> docforge::auth::clerk::ClerkConfig {
+    docforge::auth::clerk::ClerkConfig {
+        jwks_url: String::new(),
+        issuer: String::new(),
+        leeway_secs: 30,
+        dev_auth_bypass: true,
+    }
 }
 
 /// Build a fresh AppConfig for an isolated in-memory test DB.
@@ -26,8 +35,6 @@ fn test_config() -> AppConfig {
             "sqlite://file:test_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         ),
-        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-        jwt_expiry_minutes: 15,
         rate_limit_per_minute: 1000,
         api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
         anthropic_api_key: None,
@@ -44,35 +51,21 @@ fn test_config() -> AppConfig {
         clerk_jwks_url: None,
         clerk_issuer: None,
         clerk_leeway_secs: 30,
-        // Piece-6 cutover (api_keys → ClerkAuth) will flip this on and
-        // register web::Data<ClerkConfig>/JwksCache. Until then, the
-        // api_keys handlers still consume JwtAuth, so tests seed a
-        // user via upsert_from_clerk and mint a JWT directly with
-        // docforge::auth::jwt::create_token.
-        dev_auth_bypass: false,
+        // Tests drive ClerkAuth via dev-bypass + X-Dev-User-Id header.
+        dev_auth_bypass: true,
         clerk_webhook_secret: None,
     }
 }
 
-/// Seed a Clerk-mirrored user, mint a JWT for the local users.id PK,
-/// and create one API key. Returns `(app, api_key, jwt, key_id)`.
+/// Seed a Clerk-mirrored user and create one API key via the
+/// ClerkAuth-protected `/api-keys` endpoint (dev-bypass mode).
+/// Returns `(app, api_key, clerk_user_id, key_id)`.
 macro_rules! test_app_with_key {
     () => {{
         let config = test_config();
         let pool = db::init_db(&config.database_url).await.unwrap();
 
-        // Seed a user via the Clerk upsert path.
-        let clerk_id = format!("user_{}", uuid::Uuid::new_v4().simple());
-        let user = docforge::models::user::upsert_from_clerk(
-            &pool,
-            &clerk_id,
-            "p@test.com",
-            Some("Test"),
-            None,
-        )
-        .await
-        .unwrap();
-        let jwt = docforge::auth::jwt::create_token(&user.id, &config.jwt_secret, 15).unwrap();
+        let clerk_id = seed_clerk_user(&pool, "p@test.com").await;
 
         let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
         let app = test::init_service(
@@ -87,6 +80,10 @@ macro_rules! test_app_with_key {
                 ))
                 .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
                 .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+                .app_data(web::Data::new(dev_clerk_config()))
+                .app_data(web::Data::new(
+                    docforge::auth::clerk::JwksCache::new(String::new()).unwrap(),
+                ))
                 .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
                 .route("/health", web::get().to(docforge::api::health::health))
                 .route("/metrics", web::get().to(docforge::api::metrics::metrics))
@@ -109,10 +106,9 @@ macro_rules! test_app_with_key {
         )
         .await;
 
-        // Create API key via the (still JwtAuth-protected) endpoint.
         let req = test::TestRequest::post()
             .uri("/api-keys")
-            .insert_header(("Authorization", format!("Bearer {jwt}")))
+            .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
             .set_json(serde_json::json!({"name":"Test"}))
             .to_request();
         let resp = test::call_service(&app, req).await;
@@ -120,7 +116,7 @@ macro_rules! test_app_with_key {
         let api_key = body["key"].as_str().unwrap().to_string();
         let key_id = body["id"].as_str().unwrap().to_string();
 
-        (app, api_key, jwt, key_id)
+        (app, api_key, clerk_id, key_id)
     }};
 }
 
@@ -244,12 +240,12 @@ async fn test_parse_non_pdf() {
 
 #[actix_rt::test]
 async fn test_parse_revoked_key() {
-    let (app, api_key, jwt, key_id) = test_app_with_key!();
+    let (app, api_key, clerk_id, key_id) = test_app_with_key!();
 
     // Revoke
     let req = test::TestRequest::delete()
         .uri(&format!("/api-keys/{key_id}"))
-        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
         .to_request();
     test::call_service(&app, req).await;
 
@@ -508,8 +504,6 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
             "sqlite://file:test_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         ),
-        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-        jwt_expiry_minutes: 15,
         rate_limit_per_minute: 1000,
         api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
         anthropic_api_key: None,
@@ -526,14 +520,11 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
         clerk_jwks_url: None,
         clerk_issuer: None,
         clerk_leeway_secs: 30,
-        // dev_auth_bypass is wired into AppConfig but currently has no
-        // effect on these tests; see piece-6 cutover note in the
-        // sister test_app_with_key! macro for the rationale.
-        dev_auth_bypass: false,
+        dev_auth_bypass: true,
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
-    let jwt = seed_jwt(&pool, &config.jwt_secret, "big@e.com").await;
+    let clerk_id = seed_clerk_user(&pool, "big@e.com").await;
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -548,6 +539,10 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
             ))
             .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
                 .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::Data::new(dev_clerk_config()))
+            .app_data(web::Data::new(
+                docforge::auth::clerk::JwksCache::new(String::new()).unwrap(),
+            ))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
                 web::scope("/api-keys")
@@ -562,7 +557,7 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
 
     let req = test::TestRequest::post()
         .uri("/api-keys")
-        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
         .set_json(serde_json::json!({"name":"Test"}))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -669,8 +664,6 @@ async fn test_parse_returns_503_when_gate_saturated() {
             "sqlite://file:test_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         ),
-        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-        jwt_expiry_minutes: 15,
         rate_limit_per_minute: 1000,
         api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
         anthropic_api_key: None,
@@ -687,14 +680,11 @@ async fn test_parse_returns_503_when_gate_saturated() {
         clerk_jwks_url: None,
         clerk_issuer: None,
         clerk_leeway_secs: 30,
-        // dev_auth_bypass is wired into AppConfig but currently has no
-        // effect on these tests; see piece-6 cutover note in the
-        // sister test_app_with_key! macro for the rationale.
-        dev_auth_bypass: false,
+        dev_auth_bypass: true,
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
-    let jwt = seed_jwt(&pool, &config.jwt_secret, "gate@example.com").await;
+    let clerk_id = seed_clerk_user(&pool, "gate@example.com").await;
     let gate = docforge::services::parse_gate::ParseGate::new(1);
     let gate_for_holding = gate.clone();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
@@ -709,6 +699,10 @@ async fn test_parse_returns_503_when_gate_saturated() {
             .app_data(web::Data::new(gate))
             .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
                 .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::Data::new(dev_clerk_config()))
+            .app_data(web::Data::new(
+                docforge::auth::clerk::JwksCache::new(String::new()).unwrap(),
+            ))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
                 web::scope("/api-keys")
@@ -723,7 +717,7 @@ async fn test_parse_returns_503_when_gate_saturated() {
 
     let req = test::TestRequest::post()
         .uri("/api-keys")
-        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
         .set_json(serde_json::json!({"name":"Test"}))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -807,8 +801,6 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
             "sqlite://file:test_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         ),
-        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-        jwt_expiry_minutes: 15,
         rate_limit_per_minute: 1000,
         api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
         anthropic_api_key: None,
@@ -825,14 +817,11 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
         clerk_jwks_url: None,
         clerk_issuer: None,
         clerk_leeway_secs: 30,
-        // dev_auth_bypass is wired into AppConfig but currently has no
-        // effect on these tests; see piece-6 cutover note in the
-        // sister test_app_with_key! macro for the rationale.
-        dev_auth_bypass: false,
+        dev_auth_bypass: true,
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
-    let jwt = seed_jwt(&pool, &config.jwt_secret, "deadline@test.com").await;
+    let clerk_id = seed_clerk_user(&pool, "deadline@test.com").await;
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -845,6 +834,10 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
             .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
             .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
             .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::Data::new(dev_clerk_config()))
+            .app_data(web::Data::new(
+                docforge::auth::clerk::JwksCache::new(String::new()).unwrap(),
+            ))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .route("/metrics", web::get().to(docforge::api::metrics::metrics))
             .service(
@@ -859,7 +852,7 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
     .await;
     let req = test::TestRequest::post()
         .uri("/api-keys")
-        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
         .set_json(serde_json::json!({"name":"Test"}))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -916,8 +909,6 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
             "sqlite://file:test_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         ),
-        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-        jwt_expiry_minutes: 15,
         rate_limit_per_minute: 1000,
         api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
         anthropic_api_key: None,
@@ -934,14 +925,11 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
         clerk_jwks_url: None,
         clerk_issuer: None,
         clerk_leeway_secs: 30,
-        // dev_auth_bypass is wired into AppConfig but currently has no
-        // effect on these tests; see piece-6 cutover note in the
-        // sister test_app_with_key! macro for the rationale.
-        dev_auth_bypass: false,
+        dev_auth_bypass: true,
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
-    let jwt = seed_jwt(&pool, &config.jwt_secret, "degr@test.com").await;
+    let clerk_id = seed_clerk_user(&pool, "degr@test.com").await;
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -954,6 +942,10 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
             .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
             .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
             .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::Data::new(dev_clerk_config()))
+            .app_data(web::Data::new(
+                docforge::auth::clerk::JwksCache::new(String::new()).unwrap(),
+            ))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .route("/metrics", web::get().to(docforge::api::metrics::metrics))
             .service(
@@ -968,7 +960,7 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
     .await;
     let req = test::TestRequest::post()
         .uri("/api-keys")
-        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .insert_header(("X-Dev-User-Id", clerk_id.as_str()))
         .set_json(serde_json::json!({"name":"Test"}))
         .to_request();
     let resp = test::call_service(&app, req).await;

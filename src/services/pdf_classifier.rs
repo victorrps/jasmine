@@ -413,6 +413,145 @@ mod tests {
         assert_eq!(classify(&doc).class, PdfClass::ScannedOrEmpty);
     }
 
+    // ── Synthetic boundary tests ───────────────────────────────────────────
+    //
+    // These tests poke the classifier thresholds (`MIN_CHARS_PER_PAGE`,
+    // `MAX_CLASSIFIER_LINES`, `COMBINED_WEAK_SIGNAL`) directly via a
+    // hand-built `DocumentResult`. They are the regression net that
+    // protects v1 thresholds while production traffic informs tuning.
+
+    use crate::services::doc_type_detector::DocumentTypeSource;
+    use crate::services::pdf_parser::{DocumentMetadata, PageResult};
+
+    fn synth(text: &str, page_count: u32, is_scanned: bool) -> DocumentResult {
+        let total_chars = text.chars().count();
+        let per_page = if page_count == 0 { 0 } else { total_chars / page_count as usize };
+        let pages: Vec<PageResult> = (0..page_count.max(1))
+            .map(|i| PageResult {
+                page_number: i + 1,
+                text: String::new(),
+                char_count: per_page,
+            })
+            .collect();
+        DocumentResult {
+            markdown: String::new(),
+            text: text.to_string(),
+            pages,
+            tables: Vec::new(),
+            metadata: DocumentMetadata {
+                page_count,
+                pdf_version: None,
+                is_encrypted: false,
+                is_scanned,
+                detected_type: None,
+                detected_type_confidence: None,
+                detected_type_alternates: Vec::new(),
+                document_type_hint: None,
+                document_type: None,
+                document_type_source: None as Option<DocumentTypeSource>,
+                image_count: 0,
+                processing_ms: 0,
+                classification: None,
+                routed_to: None,
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn chars_per_page_just_below_min_routes_to_scanned() {
+        // 49 chars across 1 page → below MIN_CHARS_PER_PAGE (50.0).
+        let doc = synth(&"a".repeat(49), 1, false);
+        assert_eq!(classify(&doc).class, PdfClass::ScannedOrEmpty);
+    }
+
+    #[test]
+    fn chars_per_page_at_min_does_not_route_to_scanned() {
+        // 50 chars / 1 page == MIN_CHARS_PER_PAGE; the comparison is `<`,
+        // so this stays out of ScannedOrEmpty.
+        let text = "Hello world this is plain prose with enough chars.";
+        assert_eq!(text.len(), 50);
+        let doc = synth(text, 1, false);
+        assert_ne!(classify(&doc).class, PdfClass::ScannedOrEmpty);
+    }
+
+    #[test]
+    fn is_scanned_flag_forces_scanned_class_even_with_text() {
+        // Even with healthy chars/page, an upstream is_scanned=true wins.
+        let doc = synth(&"x".repeat(500), 1, true);
+        assert_eq!(classify(&doc).class, PdfClass::ScannedOrEmpty);
+    }
+
+    #[test]
+    fn empty_text_layer_with_pages_routes_to_unknown() {
+        // page_count > 0 but the dispatcher gave us empty text and the
+        // chars-per-page check did not catch it (synthetic edge case).
+        // The trim().is_empty() guard turns this into Unknown.
+        let mut doc = synth("   \n  \t  ", 1, false);
+        // Force the chars-per-page check to pass by inflating per-page.
+        doc.pages[0].char_count = 1000;
+        assert_eq!(classify(&doc).class, PdfClass::Unknown);
+    }
+
+    #[test]
+    fn combined_weak_signal_threshold_promotes_to_structured() {
+        // No single signal crosses its strong threshold, but
+        // label_density + column_alignment >= COMBINED_WEAK_SIGNAL (0.25).
+        // Build 8 lines: 1 label + 1 mid-gap row + 6 prose.
+        // label_density = 1/8 = 0.125, column_alignment = 1/8 = 0.125,
+        // sum = 0.25 → exactly at the threshold.
+        let text = "Title: report summary\n\
+                    Q1   100   $5\n\
+                    just some prose line one\n\
+                    just some prose line two\n\
+                    just some prose line three\n\
+                    just some prose line four\n\
+                    just some prose line five\n\
+                    just some prose line six\n";
+        let doc = synth(text, 1, false);
+        assert_eq!(classify(&doc).class, PdfClass::TextStructured);
+    }
+
+    #[test]
+    fn pure_prose_is_text_simple() {
+        // No labels, no mid-line gaps, no pipes — must NOT be promoted.
+        let text = (0..10)
+            .map(|i| format!("Sentence number {i} with words separated by single spaces."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let doc = synth(&text, 1, false);
+        assert_eq!(classify(&doc).class, PdfClass::TextSimple);
+    }
+
+    #[test]
+    fn line_walker_caps_at_max_classifier_lines() {
+        // 6 000 non-empty lines + a structured signal *only after* line
+        // 5 000. The cap means the classifier never sees the structured
+        // tail, so it must classify on the first 5 000 prose lines and
+        // return TextSimple — proving the cap is enforced.
+        let mut text = String::new();
+        for i in 0..MAX_CLASSIFIER_LINES + 1000 {
+            if i < MAX_CLASSIFIER_LINES {
+                text.push_str("plain prose line with single spaces only\n");
+            } else {
+                text.push_str("Field: value\n"); // would push label_density up
+            }
+        }
+        let doc = synth(&text, 80, false);
+        assert_eq!(classify(&doc).class, PdfClass::TextSimple);
+    }
+
+    #[test]
+    fn high_pipe_density_triggers_structured() {
+        // 4 ASCII-table rows: pipe density >> PIPE_DENSITY_TABLE (0.5).
+        let text = "| col1 | col2 | col3 |\n\
+                    | a    | b    | c    |\n\
+                    | d    | e    | f    |\n\
+                    | g    | h    | i    |\n";
+        let doc = synth(text, 1, false);
+        assert_eq!(classify(&doc).class, PdfClass::TextStructured);
+    }
+
     // ── Perf smoke ─────────────────────────────────────────────────────────
 
     #[test]
