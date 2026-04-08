@@ -4,6 +4,7 @@ pub mod extract;
 pub mod health;
 pub mod mcp;
 pub mod me;
+pub mod usage;
 pub mod metrics;
 pub mod parse;
 pub mod webhooks;

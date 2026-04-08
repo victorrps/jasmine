@@ -143,7 +143,11 @@ async fn main() -> anyhow::Result<()> {
                     .route("/parse/batch", web::post().to(api::batch::batch_parse))
                     .route("/parse/batch/async", web::post().to(api::batch::batch_parse_async))
                     .route("/parse/batch/{batch_id}", web::get().to(api::batch::batch_status))
-                    .route("/usage", web::get().to(api::billing::get_usage)),
+                    .route("/usage", web::get().to(api::billing::get_usage))
+                    .route(
+                        "/usage/summary",
+                        web::get().to(api::usage::get_usage_summary),
+                    ),
             )
             // Billing (public + webhook)
             .service(
