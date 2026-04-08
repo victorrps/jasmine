@@ -149,7 +149,15 @@ async fn main() -> anyhow::Result<()> {
             .service(
                 web::scope("/billing")
                     .route("/plans", web::get().to(api::billing::list_plans))
-                    .route("/webhook", web::post().to(api::billing::stripe_webhook)),
+                    .route("/webhook", web::post().to(api::billing::stripe_webhook))
+                    .route(
+                        "/checkout-session",
+                        web::post().to(api::billing::create_checkout_session),
+                    )
+                    .route(
+                        "/portal-session",
+                        web::post().to(api::billing::create_portal_session),
+                    ),
             )
             // Clerk webhooks (Svix-signed; no auth middleware — the
             // signature IS the auth)

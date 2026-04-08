@@ -109,6 +109,23 @@ pub async fn get_local_id_by_clerk_id(
     Err(AppError::NotFound)
 }
 
+/// Persist a Stripe customer ID against the local user row.
+pub async fn set_stripe_customer_id(
+    pool: &SqlitePool,
+    user_id: &str,
+    customer_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE users SET stripe_customer_id = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(customer_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(AppError::Database)?;
+    Ok(())
+}
+
 /// Hard-delete a user by Clerk ID, cleaning up dependent rows.
 ///
 /// `api_keys` has `ON DELETE CASCADE` on `user_id`, but `usage_logs`

@@ -13,10 +13,19 @@ pub struct AppConfig {
     /// Anthropic API key for Claude Haiku schema extraction. Optional — falls back to stub.
     pub anthropic_api_key: Option<String>,
     /// Stripe secret key for metered billing. Optional — billing features disabled without it.
-    #[allow(dead_code)]
     pub stripe_secret_key: Option<String>,
     /// Stripe webhook signing secret. Optional — signature verification skipped without it.
     pub stripe_webhook_secret: Option<String>,
+    /// Where Stripe redirects after a successful checkout session.
+    pub stripe_success_url: Option<String>,
+    /// Where Stripe redirects when the customer cancels checkout.
+    pub stripe_cancel_url: Option<String>,
+    /// Where Stripe redirects after the customer leaves the billing portal.
+    pub stripe_portal_return_url: Option<String>,
+    /// Stripe price ID for the Starter tier subscription.
+    pub stripe_price_starter: Option<String>,
+    /// Stripe price ID for the Pro tier subscription.
+    pub stripe_price_pro: Option<String>,
     /// Path to tesseract binary for local OCR. Defaults to "tesseract" (found via PATH).
     pub tesseract_path: String,
     /// Path to pdftoppm binary for PDF-to-image conversion. Defaults to "pdftoppm" (found via PATH).
@@ -137,6 +146,11 @@ impl AppConfig {
         let anthropic_api_key = get("ANTHROPIC_API_KEY").filter(|k| !k.is_empty());
         let stripe_secret_key = get("STRIPE_SECRET_KEY").filter(|k| !k.is_empty());
         let stripe_webhook_secret = get("STRIPE_WEBHOOK_SECRET").filter(|k| !k.is_empty());
+        let stripe_success_url = get("STRIPE_SUCCESS_URL").filter(|k| !k.is_empty());
+        let stripe_cancel_url = get("STRIPE_CANCEL_URL").filter(|k| !k.is_empty());
+        let stripe_portal_return_url = get("STRIPE_PORTAL_RETURN_URL").filter(|k| !k.is_empty());
+        let stripe_price_starter = get("STRIPE_PRICE_STARTER").filter(|k| !k.is_empty());
+        let stripe_price_pro = get("STRIPE_PRICE_PRO").filter(|k| !k.is_empty());
 
         let tesseract_path =
             get("TESSERACT_PATH").unwrap_or_else(|| "tesseract".into());
@@ -244,6 +258,11 @@ impl AppConfig {
             anthropic_api_key,
             stripe_secret_key,
             stripe_webhook_secret,
+            stripe_success_url,
+            stripe_cancel_url,
+            stripe_portal_return_url,
+            stripe_price_starter,
+            stripe_price_pro,
             tesseract_path,
             pdftoppm_path,
             paddleocr_url,

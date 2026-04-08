@@ -1,11 +1,13 @@
 use actix_web::{web, HttpRequest, HttpResponse};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::auth::api_key::ApiKeyAuth;
+use crate::auth::clerk::{ClerkAuth, ClerkConfig};
 use crate::config::AppConfig;
 use crate::errors::AppError;
 use crate::middleware::request_id::RequestId;
+use crate::models;
 use crate::services::billing::{self, PricingTier};
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -214,6 +216,222 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ── Stripe Checkout + Customer Portal ────────────────────────────────────────
+
+const STRIPE_API_BASE: &str = "https://api.stripe.com/v1";
+
+#[derive(Debug, Deserialize)]
+pub struct CheckoutSessionRequest {
+    pub tier: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckoutSessionResponse {
+    pub session_id: String,
+    pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortalSessionResponse {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeCustomerResponse {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeCheckoutSessionResponse {
+    id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripePortalSessionResponse {
+    url: String,
+}
+
+/// Build the form-encoded body for a Stripe Checkout Session create call.
+/// Pure helper so the URL/price encoding is unit-testable without HTTP.
+pub fn build_checkout_form_body(
+    customer_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("mode", "subscription".to_string()),
+        ("customer", customer_id.to_string()),
+        ("line_items[0][price]", price_id.to_string()),
+        ("line_items[0][quantity]", "1".to_string()),
+        ("success_url", success_url.to_string()),
+        ("cancel_url", cancel_url.to_string()),
+    ]
+}
+
+fn dev_auto_provision(clerk_cfg: &ClerkConfig) -> bool {
+    clerk_cfg.dev_auth_bypass && clerk_cfg.jwks_url.is_empty()
+}
+
+fn require<'a>(opt: &'a Option<String>, what: &str) -> Result<&'a str, AppError> {
+    opt.as_deref().ok_or_else(|| {
+        AppError::NotImplemented(format!("Stripe billing not configured: missing {what}"))
+    })
+}
+
+async fn ensure_stripe_customer(
+    pool: &SqlitePool,
+    stripe_key: &str,
+    user: &models::user::User,
+) -> Result<String, AppError> {
+    if let Some(existing) = user.stripe_customer_id.as_ref() {
+        return Ok(existing.clone());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Internal(format!("reqwest client: {e}")))?;
+    let resp = client
+        .post(format!("{STRIPE_API_BASE}/customers"))
+        .basic_auth(stripe_key, None::<&str>)
+        .form(&[
+            ("email", user.email.as_str()),
+            ("metadata[user_id]", user.id.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::UpstreamApi(format!("Stripe customers: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::error!(%status, body, "Stripe customer create failed");
+        return Err(AppError::UpstreamApi("Stripe customer create failed".into()));
+    }
+    let parsed: StripeCustomerResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::UpstreamApi(format!("Stripe customer parse: {e}")))?;
+    models::user::set_stripe_customer_id(pool, &user.id, &parsed.id).await?;
+    Ok(parsed.id)
+}
+
+async fn load_user_for_clerk(
+    pool: &SqlitePool,
+    clerk_cfg: &ClerkConfig,
+    clerk_user_id: &str,
+) -> Result<models::user::User, AppError> {
+    if let Some(u) = models::user::find_by_clerk_id(pool, clerk_user_id).await? {
+        return Ok(u);
+    }
+    if dev_auto_provision(clerk_cfg) {
+        let email = format!("{clerk_user_id}@dev.local");
+        return models::user::upsert_from_clerk(pool, clerk_user_id, &email, None, None).await;
+    }
+    Err(AppError::NotFound)
+}
+
+/// `POST /billing/checkout-session` — start a Stripe Checkout flow for the
+/// authenticated user. Returns 503 (NotImplemented) when Stripe is not
+/// configured for this deployment.
+#[tracing::instrument(skip(auth, pool, config, clerk_cfg, body), fields(clerk_user_id = %auth.clerk_user_id))]
+pub async fn create_checkout_session(
+    auth: ClerkAuth,
+    pool: web::Data<SqlitePool>,
+    config: web::Data<AppConfig>,
+    clerk_cfg: web::Data<ClerkConfig>,
+    body: web::Json<CheckoutSessionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let stripe_key = require(&config.stripe_secret_key, "STRIPE_SECRET_KEY")?;
+    let success_url = require(&config.stripe_success_url, "STRIPE_SUCCESS_URL")?;
+    let cancel_url = require(&config.stripe_cancel_url, "STRIPE_CANCEL_URL")?;
+
+    let price_id = match body.tier.to_ascii_lowercase().as_str() {
+        "starter" => require(&config.stripe_price_starter, "STRIPE_PRICE_STARTER")?,
+        "pro" => require(&config.stripe_price_pro, "STRIPE_PRICE_PRO")?,
+        other => {
+            return Err(AppError::Validation(format!(
+                "Unsupported tier: {other}. Supported: starter, pro"
+            )));
+        }
+    };
+
+    let user = load_user_for_clerk(pool.get_ref(), clerk_cfg.get_ref(), &auth.clerk_user_id).await?;
+    let customer_id = ensure_stripe_customer(pool.get_ref(), stripe_key, &user).await?;
+
+    let form = build_checkout_form_body(&customer_id, price_id, success_url, cancel_url);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Internal(format!("reqwest client: {e}")))?;
+    let resp = client
+        .post(format!("{STRIPE_API_BASE}/checkout/sessions"))
+        .basic_auth(stripe_key, None::<&str>)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| AppError::UpstreamApi(format!("Stripe checkout: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::error!(%status, body, "Stripe checkout session create failed");
+        return Err(AppError::UpstreamApi("Stripe checkout failed".into()));
+    }
+    let parsed: StripeCheckoutSessionResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::UpstreamApi(format!("Stripe checkout parse: {e}")))?;
+
+    Ok(HttpResponse::Ok().json(CheckoutSessionResponse {
+        session_id: parsed.id,
+        url: parsed.url,
+    }))
+}
+
+/// `POST /billing/portal-session` — return a Customer Portal URL for the
+/// authenticated user. Requires an existing `stripe_customer_id`; users
+/// who have never started a checkout flow get a 400 with a clear message.
+#[tracing::instrument(skip(auth, pool, config, clerk_cfg), fields(clerk_user_id = %auth.clerk_user_id))]
+pub async fn create_portal_session(
+    auth: ClerkAuth,
+    pool: web::Data<SqlitePool>,
+    config: web::Data<AppConfig>,
+    clerk_cfg: web::Data<ClerkConfig>,
+) -> Result<HttpResponse, AppError> {
+    let stripe_key = require(&config.stripe_secret_key, "STRIPE_SECRET_KEY")?;
+    let return_url = require(&config.stripe_portal_return_url, "STRIPE_PORTAL_RETURN_URL")?;
+
+    let user = load_user_for_clerk(pool.get_ref(), clerk_cfg.get_ref(), &auth.clerk_user_id).await?;
+    let customer_id = user.stripe_customer_id.as_deref().ok_or_else(|| {
+        AppError::Validation(
+            "no Stripe customer — open a checkout session first".into(),
+        )
+    })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Internal(format!("reqwest client: {e}")))?;
+    let resp = client
+        .post(format!("{STRIPE_API_BASE}/billing_portal/sessions"))
+        .basic_auth(stripe_key, None::<&str>)
+        .form(&[("customer", customer_id), ("return_url", return_url)])
+        .send()
+        .await
+        .map_err(|e| AppError::UpstreamApi(format!("Stripe portal: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::error!(%status, body, "Stripe portal session create failed");
+        return Err(AppError::UpstreamApi("Stripe portal failed".into()));
+    }
+    let parsed: StripePortalSessionResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::UpstreamApi(format!("Stripe portal parse: {e}")))?;
+    Ok(HttpResponse::Ok().json(PortalSessionResponse { url: parsed.url }))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -346,6 +564,124 @@ mod tests {
         let resp = WebhookResponse { received: true };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["received"], true);
+    }
+
+    // ── Checkout / portal ───────────────────────────────────────────────
+
+    #[test]
+    fn build_checkout_form_body_encodes_all_required_fields() {
+        let form = build_checkout_form_body(
+            "cus_123",
+            "price_456",
+            "https://app/success",
+            "https://app/cancel",
+        );
+        let map: std::collections::HashMap<_, _> = form.into_iter().collect();
+        assert_eq!(map["mode"], "subscription");
+        assert_eq!(map["customer"], "cus_123");
+        assert_eq!(map["line_items[0][price]"], "price_456");
+        assert_eq!(map["line_items[0][quantity]"], "1");
+        assert_eq!(map["success_url"], "https://app/success");
+        assert_eq!(map["cancel_url"], "https://app/cancel");
+    }
+
+    fn dev_clerk_cfg() -> ClerkConfig {
+        ClerkConfig {
+            jwks_url: String::new(),
+            issuer: String::new(),
+            leeway_secs: 30,
+            dev_auth_bypass: true,
+        }
+    }
+
+    fn unconfigured_app_config() -> AppConfig {
+        AppConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            database_url: "sqlite::memory:".into(),
+            rate_limit_per_minute: 60,
+            api_key_pepper: "x".repeat(32),
+            anthropic_api_key: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_success_url: None,
+            stripe_cancel_url: None,
+            stripe_portal_return_url: None,
+            stripe_price_starter: None,
+            stripe_price_pro: None,
+            tesseract_path: "tesseract".into(),
+            pdftoppm_path: "pdftoppm".into(),
+            paddleocr_url: None,
+            paddleocr_timeout_secs: 120,
+            paddleocr_mode: crate::config::PaddleOcrMode::Fallback,
+            max_concurrent_parses: 8,
+            parse_deadline_secs: 90,
+            extract_max_input_chars: 200_000,
+            clerk_jwks_url: None,
+            clerk_issuer: None,
+            clerk_leeway_secs: 30,
+            dev_auth_bypass: true,
+            clerk_webhook_secret: None,
+        }
+    }
+
+    async fn fresh_pool() -> SqlitePool {
+        let url = format!(
+            "sqlite://file:billing_test_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        crate::db::init_db(&url).await.unwrap()
+    }
+
+    #[actix_test]
+    async fn checkout_session_returns_not_implemented_when_stripe_unconfigured() {
+        let pool = fresh_pool().await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(actix_web::web::Data::new(pool))
+                .app_data(actix_web::web::Data::new(unconfigured_app_config()))
+                .app_data(actix_web::web::Data::new(dev_clerk_cfg()))
+                .app_data(actix_web::web::Data::new(
+                    crate::auth::clerk::JwksCache::new(String::new()).unwrap(),
+                ))
+                .route(
+                    "/billing/checkout-session",
+                    actix_web::web::post().to(create_checkout_session),
+                ),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/billing/checkout-session")
+            .insert_header(("X-Dev-User-Id", "user_test_co"))
+            .set_json(serde_json::json!({"tier": "starter"}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 501);
+    }
+
+    #[actix_test]
+    async fn portal_session_returns_not_implemented_when_stripe_unconfigured() {
+        let pool = fresh_pool().await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(actix_web::web::Data::new(pool))
+                .app_data(actix_web::web::Data::new(unconfigured_app_config()))
+                .app_data(actix_web::web::Data::new(dev_clerk_cfg()))
+                .app_data(actix_web::web::Data::new(
+                    crate::auth::clerk::JwksCache::new(String::new()).unwrap(),
+                ))
+                .route(
+                    "/billing/portal-session",
+                    actix_web::web::post().to(create_portal_session),
+                ),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/billing/portal-session")
+            .insert_header(("X-Dev-User-Id", "user_test_po"))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 501);
     }
 
     #[test]
