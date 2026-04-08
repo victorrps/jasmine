@@ -120,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
             // Health + metrics (unauthenticated; protect via network policy)
             .route("/health", web::get().to(api::health::health))
             .route("/metrics", web::get().to(api::metrics::metrics))
+            // Authenticated user mirror (Clerk JWT or dev-bypass header)
+            .route("/me", web::get().to(api::me::get_me))
             // API key management — TODO(piece-6): swap JwtAuth for ClerkAuth.
             // The /auth/{register,login,oauth/*} endpoints were removed in
             // piece-4: identity is now owned by Clerk and provisioned via

@@ -3,6 +3,7 @@ pub mod billing;
 pub mod extract;
 pub mod health;
 pub mod mcp;
+pub mod me;
 pub mod metrics;
 pub mod parse;
 pub mod webhooks;

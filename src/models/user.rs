@@ -23,8 +23,6 @@ pub struct User {
 }
 
 /// Find a user by Clerk user ID.
-// TODO(piece-5): drop allow once GET /me consumes this.
-#[allow(dead_code)]
 pub async fn find_by_clerk_id(
     pool: &SqlitePool,
     clerk_user_id: &str,
