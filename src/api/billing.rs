@@ -82,6 +82,11 @@ pub async fn list_plans() -> HttpResponse {
     HttpResponse::Ok().json(PlansResponse { plans })
 }
 
+/// Maximum accepted Stripe webhook body size. Real Stripe events top
+/// out around ~8KB; 64KB is a comfortable ceiling that still bounds
+/// memory in the pre-HMAC buffering phase.
+const MAX_STRIPE_WEBHOOK_BODY: usize = 64 * 1024;
+
 /// POST /billing/webhook — Stripe webhook receiver.
 ///
 /// Verifies the `Stripe-Signature` header using HMAC-SHA256 over
@@ -99,6 +104,20 @@ pub async fn stripe_webhook(
             "error": "Webhook receiver not configured"
         }));
     };
+
+    // Bound memory before we even look at headers. The global actix
+    // PayloadConfig cap is 50MB for PDF uploads — too generous for a
+    // webhook that will reject anything non-Stripe-shaped anyway.
+    if body.len() > MAX_STRIPE_WEBHOOK_BODY {
+        tracing::warn!(
+            body_len = body.len(),
+            cap = MAX_STRIPE_WEBHOOK_BODY,
+            "Stripe webhook rejected: body exceeds cap"
+        );
+        return HttpResponse::PayloadTooLarge().json(serde_json::json!({
+            "error": "Webhook body exceeds size cap"
+        }));
+    }
 
     let stripe_signature = req
         .headers()
@@ -119,17 +138,20 @@ pub async fn stripe_webhook(
         }));
     }
 
-    let sig_display = sig_header;
-
     // Attempt to parse the event type from the JSON body
     let event_type = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("type")?.as_str().map(String::from))
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Log only the leading timestamp fragment of the signature (first
+    // ~24 chars, enough to correlate with Stripe dashboard retries)
+    // rather than the full ~200 byte hex string — the signature is
+    // not a secret but it bloats log volume.
+    let sig_prefix = sig_header.get(..sig_header.len().min(24)).unwrap_or("");
     tracing::info!(
         event_type,
-        stripe_signature = sig_display,
+        sig_prefix = sig_prefix,
         body_len = body.len(),
         "Stripe webhook received"
     );
@@ -219,6 +241,35 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // ── Stripe Checkout + Customer Portal ────────────────────────────────────────
 
 const STRIPE_API_BASE: &str = "https://api.stripe.com/v1";
+const STRIPE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Shared HTTP client for Stripe API calls. Built once at startup and
+/// stored in `web::Data` so handlers reuse its connection pool + TLS
+/// session cache across requests. Previously each handler built its
+/// own client per call, leaking FDs and thrashing TCP state.
+pub fn build_stripe_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .timeout(STRIPE_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| AppError::Internal(format!("stripe http client: {e}")))
+}
+
+/// Parse a Stripe error body down to its stable `code` + `message`
+/// fields. Stripe error JSON looks like `{"error": {"code":"...",
+/// "message":"...", ...}}`, and the rest of the body can contain PII
+/// (billing email in 409 duplicate customer errors) or card metadata
+/// we don't want in structured logs. Return a compact display string.
+fn summarize_stripe_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            let err = v.get("error")?;
+            let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("-");
+            let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("-");
+            Some(format!("code={code} message={message}"))
+        })
+        .unwrap_or_else(|| "<unparseable>".to_string())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CheckoutSessionRequest {
@@ -270,10 +321,6 @@ pub fn build_checkout_form_body(
     ]
 }
 
-fn dev_auto_provision(clerk_cfg: &ClerkConfig) -> bool {
-    clerk_cfg.dev_auth_bypass && clerk_cfg.jwks_url.is_empty()
-}
-
 fn require<'a>(opt: &'a Option<String>, what: &str) -> Result<&'a str, AppError> {
     opt.as_deref().ok_or_else(|| {
         AppError::NotImplemented(format!("Stripe billing not configured: missing {what}"))
@@ -282,17 +329,14 @@ fn require<'a>(opt: &'a Option<String>, what: &str) -> Result<&'a str, AppError>
 
 async fn ensure_stripe_customer(
     pool: &SqlitePool,
+    http: &reqwest::Client,
     stripe_key: &str,
     user: &models::user::User,
 ) -> Result<String, AppError> {
     if let Some(existing) = user.stripe_customer_id.as_ref() {
         return Ok(existing.clone());
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Internal(format!("reqwest client: {e}")))?;
-    let resp = client
+    let resp = http
         .post(format!("{STRIPE_API_BASE}/customers"))
         .basic_auth(stripe_key, None::<&str>)
         .form(&[
@@ -305,7 +349,8 @@ async fn ensure_stripe_customer(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        tracing::error!(%status, body, "Stripe customer create failed");
+        let summary = summarize_stripe_error(&body);
+        tracing::error!(%status, error = %summary, "Stripe customer create failed");
         return Err(AppError::UpstreamApi("Stripe customer create failed".into()));
     }
     let parsed: StripeCustomerResponse = resp
@@ -324,7 +369,7 @@ async fn load_user_for_clerk(
     if let Some(u) = models::user::find_by_clerk_id(pool, clerk_user_id).await? {
         return Ok(u);
     }
-    if dev_auto_provision(clerk_cfg) {
+    if clerk_cfg.dev_auto_provision() {
         let email = format!("{clerk_user_id}@dev.local");
         return models::user::upsert_from_clerk(pool, clerk_user_id, &email, None, None).await;
     }
@@ -332,14 +377,15 @@ async fn load_user_for_clerk(
 }
 
 /// `POST /billing/checkout-session` — start a Stripe Checkout flow for the
-/// authenticated user. Returns 503 (NotImplemented) when Stripe is not
+/// authenticated user. Returns 501 (NotImplemented) when Stripe is not
 /// configured for this deployment.
-#[tracing::instrument(skip(auth, pool, config, clerk_cfg, body), fields(clerk_user_id = %auth.clerk_user_id))]
+#[tracing::instrument(skip(auth, pool, config, clerk_cfg, http, body), fields(clerk_user_id = %auth.clerk_user_id))]
 pub async fn create_checkout_session(
     auth: ClerkAuth,
     pool: web::Data<SqlitePool>,
     config: web::Data<AppConfig>,
     clerk_cfg: web::Data<ClerkConfig>,
+    http: web::Data<reqwest::Client>,
     body: web::Json<CheckoutSessionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let stripe_key = require(&config.stripe_secret_key, "STRIPE_SECRET_KEY")?;
@@ -357,14 +403,11 @@ pub async fn create_checkout_session(
     };
 
     let user = load_user_for_clerk(pool.get_ref(), clerk_cfg.get_ref(), &auth.clerk_user_id).await?;
-    let customer_id = ensure_stripe_customer(pool.get_ref(), stripe_key, &user).await?;
+    let customer_id =
+        ensure_stripe_customer(pool.get_ref(), http.get_ref(), stripe_key, &user).await?;
 
     let form = build_checkout_form_body(&customer_id, price_id, success_url, cancel_url);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Internal(format!("reqwest client: {e}")))?;
-    let resp = client
+    let resp = http
         .post(format!("{STRIPE_API_BASE}/checkout/sessions"))
         .basic_auth(stripe_key, None::<&str>)
         .form(&form)
@@ -374,7 +417,8 @@ pub async fn create_checkout_session(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        tracing::error!(%status, body, "Stripe checkout session create failed");
+        let summary = summarize_stripe_error(&body);
+        tracing::error!(%status, error = %summary, "Stripe checkout session create failed");
         return Err(AppError::UpstreamApi("Stripe checkout failed".into()));
     }
     let parsed: StripeCheckoutSessionResponse = resp
@@ -391,12 +435,13 @@ pub async fn create_checkout_session(
 /// `POST /billing/portal-session` — return a Customer Portal URL for the
 /// authenticated user. Requires an existing `stripe_customer_id`; users
 /// who have never started a checkout flow get a 400 with a clear message.
-#[tracing::instrument(skip(auth, pool, config, clerk_cfg), fields(clerk_user_id = %auth.clerk_user_id))]
+#[tracing::instrument(skip(auth, pool, config, clerk_cfg, http), fields(clerk_user_id = %auth.clerk_user_id))]
 pub async fn create_portal_session(
     auth: ClerkAuth,
     pool: web::Data<SqlitePool>,
     config: web::Data<AppConfig>,
     clerk_cfg: web::Data<ClerkConfig>,
+    http: web::Data<reqwest::Client>,
 ) -> Result<HttpResponse, AppError> {
     let stripe_key = require(&config.stripe_secret_key, "STRIPE_SECRET_KEY")?;
     let return_url = require(&config.stripe_portal_return_url, "STRIPE_PORTAL_RETURN_URL")?;
@@ -408,11 +453,7 @@ pub async fn create_portal_session(
         )
     })?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Internal(format!("reqwest client: {e}")))?;
-    let resp = client
+    let resp = http
         .post(format!("{STRIPE_API_BASE}/billing_portal/sessions"))
         .basic_auth(stripe_key, None::<&str>)
         .form(&[("customer", customer_id), ("return_url", return_url)])
@@ -422,7 +463,8 @@ pub async fn create_portal_session(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        tracing::error!(%status, body, "Stripe portal session create failed");
+        let summary = summarize_stripe_error(&body);
+        tracing::error!(%status, error = %summary, "Stripe portal session create failed");
         return Err(AppError::UpstreamApi("Stripe portal failed".into()));
     }
     let parsed: StripePortalSessionResponse = resp
@@ -644,6 +686,7 @@ mod tests {
                 .app_data(actix_web::web::Data::new(
                     crate::auth::clerk::JwksCache::new(String::new()).unwrap(),
                 ))
+                .app_data(actix_web::web::Data::new(build_stripe_client().unwrap()))
                 .route(
                     "/billing/checkout-session",
                     actix_web::web::post().to(create_checkout_session),
@@ -670,6 +713,7 @@ mod tests {
                 .app_data(actix_web::web::Data::new(
                     crate::auth::clerk::JwksCache::new(String::new()).unwrap(),
                 ))
+                .app_data(actix_web::web::Data::new(build_stripe_client().unwrap()))
                 .route(
                     "/billing/portal-session",
                     actix_web::web::post().to(create_portal_session),

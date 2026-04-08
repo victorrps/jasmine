@@ -10,11 +10,70 @@
 //! a silent insert — so a misconfigured webhook surfaces immediately.
 
 use actix_web::{web, HttpResponse};
+use serde::Serialize;
 use sqlx::SqlitePool;
 
 use crate::auth::clerk::{ClerkAuth, ClerkConfig};
 use crate::errors::AppError;
 use crate::models;
+
+/// DTO for `GET /me`. Deliberately narrower than the full `User`
+/// struct: we hide `stripe_subscription_id` and
+/// `stripe_subscription_item_id` (Stripe's internal IDs, not useful
+/// to a frontend) and only expose whether a subscription exists via
+/// `has_active_subscription`. `stripe_customer_id` is exposed so the
+/// frontend can correlate with Stripe Checkout redirects.
+#[derive(Debug, Serialize)]
+pub struct MeResponse {
+    pub id: String,
+    pub clerk_user_id: String,
+    pub email: String,
+    pub name: Option<String>,
+    pub image_url: Option<String>,
+    pub tier: String,
+    pub stripe_customer_id: Option<String>,
+    pub has_active_subscription: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<models::user::User> for MeResponse {
+    fn from(u: models::user::User) -> Self {
+        let has_active_subscription = u.stripe_subscription_id.is_some();
+        MeResponse {
+            id: u.id,
+            clerk_user_id: u.clerk_user_id,
+            email: u.email,
+            name: u.name,
+            image_url: u.image_url,
+            tier: u.tier,
+            stripe_customer_id: u.stripe_customer_id,
+            has_active_subscription,
+            created_at: u.created_at,
+            updated_at: u.updated_at,
+        }
+    }
+}
+
+/// Inner logic for `/me`, separated from the `ClerkAuth` extractor so
+/// it can be unit-tested directly — the extractor requires a real JWT
+/// or the dev-bypass header, neither of which fit a pure model-level
+/// test for the "user missing in production mode" arm.
+async fn resolve_me(
+    clerk_user_id: &str,
+    pool: &SqlitePool,
+    clerk_cfg: &ClerkConfig,
+) -> Result<MeResponse, AppError> {
+    if let Some(user) = models::user::find_by_clerk_id(pool, clerk_user_id).await? {
+        return Ok(user.into());
+    }
+    if clerk_cfg.dev_auto_provision() {
+        let email = format!("{clerk_user_id}@dev.local");
+        let user = models::user::upsert_from_clerk(pool, clerk_user_id, &email, None, None).await?;
+        return Ok(user.into());
+    }
+    Err(AppError::NotFound)
+}
 
 /// `GET /me` — fetch (or in dev-bypass, lazily provision) the local user.
 #[tracing::instrument(skip(auth, pool, clerk_cfg), fields(clerk_user_id = %auth.clerk_user_id))]
@@ -23,28 +82,8 @@ pub async fn get_me(
     pool: web::Data<SqlitePool>,
     clerk_cfg: web::Data<ClerkConfig>,
 ) -> Result<HttpResponse, AppError> {
-    if let Some(user) = models::user::find_by_clerk_id(pool.get_ref(), &auth.clerk_user_id).await? {
-        return Ok(HttpResponse::Ok().json(user));
-    }
-
-    // Dev-bypass auto-provisioning. The double check
-    // (`dev_auth_bypass && jwks_url.is_empty()`) mirrors the same
-    // invariant the ClerkAuth extractor enforces, so a misconfigured
-    // deploy cannot accidentally auto-create rows from real Clerk JWTs.
-    if clerk_cfg.dev_auth_bypass && clerk_cfg.jwks_url.is_empty() {
-        let email = format!("{}@dev.local", auth.clerk_user_id);
-        let user = models::user::upsert_from_clerk(
-            pool.get_ref(),
-            &auth.clerk_user_id,
-            &email,
-            None,
-            None,
-        )
-        .await?;
-        return Ok(HttpResponse::Ok().json(user));
-    }
-
-    Err(AppError::NotFound)
+    let me = resolve_me(&auth.clerk_user_id, pool.get_ref(), clerk_cfg.get_ref()).await?;
+    Ok(HttpResponse::Ok().json(me))
 }
 
 #[cfg(test)]
@@ -135,29 +174,59 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn non_dev_mode_missing_user_returns_404() {
-        // Production-like config: real JWKS URL present, no bypass.
-        // Without a JWT verifier we can't drive a real auth path here,
-        // but we can still hit the not-found arm by exercising the
-        // dev-bypass extractor branch with `dev_auth_bypass=false` —
-        // which the extractor will reject with 401, not 404. So instead
-        // we test the inner `find_by_clerk_id`-returns-None path with a
-        // *bypass-enabled* config but pre-checking it bails out into
-        // dev-provision mode. To test the true 404 we exercise the
-        // logic: if find_by_clerk_id returns None and bypass is OFF,
-        // we expect Err(NotFound). We assert this directly via the
-        // handler logic with a synthesized request whose auth has
-        // already been performed (we can't easily, so test the model +
-        // configuration invariant instead).
+    async fn resolve_me_returns_not_found_in_prod_when_user_missing() {
+        // Directly test the inner function — the extractor pathway is
+        // unreachable in a unit test without a real JWT, but the
+        // branch we care about (no row + no dev bypass → 404) lives
+        // in `resolve_me`, not the extractor.
         let pool = fresh_pool().await;
         let cfg = prod_clerk_config();
-        // Sanity: prod config does NOT enable bypass, so the "missing
-        // user" arm in `get_me` will return NotFound.
-        assert!(!(cfg.dev_auth_bypass && cfg.jwks_url.is_empty()));
-        // And there is no row for this clerk id.
-        let row = models::user::find_by_clerk_id(&pool, "user_missing")
+        let err = resolve_me("user_missing_in_prod", &pool, &cfg)
+            .await
+            .expect_err("must 404 when row is missing in prod mode");
+        assert!(matches!(err, AppError::NotFound));
+    }
+
+    #[actix_rt::test]
+    async fn resolve_me_projects_user_into_me_response() {
+        // Verify the DTO hides the internal Stripe subscription IDs.
+        let pool = fresh_pool().await;
+        models::user::upsert_from_clerk(
+            &pool,
+            "user_proj",
+            "proj@test.com",
+            Some("Proj"),
+            Some("https://cdn/avatar.png"),
+        )
+        .await
+        .unwrap();
+        // Backfill subscription internals via raw SQL (no model helper
+        // for it — these columns are Stripe-internal).
+        sqlx::query(
+            "UPDATE users SET stripe_subscription_id = ?, \
+             stripe_subscription_item_id = ? WHERE clerk_user_id = ?",
+        )
+        .bind("sub_abc")
+        .bind("si_abc")
+        .bind("user_proj")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let me = resolve_me("user_proj", &pool, &dev_clerk_config())
             .await
             .unwrap();
-        assert!(row.is_none());
+        assert_eq!(me.clerk_user_id, "user_proj");
+        assert_eq!(me.email, "proj@test.com");
+        assert_eq!(me.image_url.as_deref(), Some("https://cdn/avatar.png"));
+        assert!(me.has_active_subscription);
+
+        // Serialize and check that the DTO JSON does NOT carry the
+        // raw subscription IDs — that's the whole point of the
+        // projection.
+        let json = serde_json::to_value(&me).unwrap();
+        assert!(json.get("stripe_subscription_id").is_none());
+        assert!(json.get("stripe_subscription_item_id").is_none());
+        assert_eq!(json["has_active_subscription"], true);
     }
 }

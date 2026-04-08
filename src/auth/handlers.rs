@@ -31,8 +31,12 @@ async fn local_user_id(
     pool: &SqlitePool,
     clerk_cfg: &ClerkConfig,
 ) -> Result<String, AppError> {
-    let dev_auto = clerk_cfg.dev_auth_bypass && clerk_cfg.jwks_url.is_empty();
-    models::user::get_local_id_by_clerk_id(pool, &auth.clerk_user_id, dev_auto).await
+    models::user::get_local_id_by_clerk_id(
+        pool,
+        &auth.clerk_user_id,
+        clerk_cfg.dev_auto_provision(),
+    )
+    .await
 }
 
 // --- Handlers ---

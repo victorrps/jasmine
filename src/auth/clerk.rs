@@ -44,8 +44,8 @@ use crate::errors::AppError;
 /// Default JWT clock-skew leeway in seconds. Clerk's session tokens are
 /// short-lived (~60s) so we keep this small. 30s is enough to absorb
 /// realistic clock drift between our server, the customer's browser,
-/// and Clerk's edge.
-#[allow(dead_code)]
+/// and Clerk's edge. Consumed by the `AppConfig` default for
+/// `clerk_leeway_secs` in `config::from_vars`.
 pub const DEFAULT_LEEWAY_SECS: u64 = 30;
 
 /// Minimum interval between JWKS refresh fetches. Bounds the rate at
@@ -82,6 +82,16 @@ pub struct ClerkConfig {
     /// URL — but the extractor still re-checks the invariant on every
     /// request so a misconfigured deploy fails closed.
     pub dev_auth_bypass: bool,
+}
+
+impl ClerkConfig {
+    /// Whether handlers should auto-provision missing local user rows
+    /// on first contact. True only in dev-bypass mode — same invariant
+    /// as the `ClerkAuth` extractor's bypass branch. Centralising it
+    /// here means callers can't drift.
+    pub fn dev_auto_provision(&self) -> bool {
+        self.dev_auth_bypass && self.jwks_url.is_empty()
+    }
 }
 
 /// Subset of Clerk's session JWT claims we care about. Clerk emits

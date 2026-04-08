@@ -62,8 +62,11 @@ pub async fn get_usage_summary(
     clerk_cfg: web::Data<ClerkConfig>,
     query: web::Query<UsageSummaryQuery>,
 ) -> Result<HttpResponse, AppError> {
-    let dev_auto = clerk_cfg.dev_auth_bypass && clerk_cfg.jwks_url.is_empty();
-    let user_id = models::user::get_local_id_by_clerk_id(&pool, &auth.clerk_user_id, dev_auto)
+    let user_id = models::user::get_local_id_by_clerk_id(
+        &pool,
+        &auth.clerk_user_id,
+        clerk_cfg.dev_auto_provision(),
+    )
         .await?;
 
     let period_days = clamp_period(query.period.as_deref());

@@ -220,9 +220,9 @@ impl AppConfig {
             );
         }
         let clerk_leeway_secs: u64 = get("CLERK_LEEWAY_SECS")
-            .unwrap_or_else(|| "30".into())
-            .parse()
-            .context("CLERK_LEEWAY_SECS must be a valid u64")?;
+            .map(|s| s.parse::<u64>().context("CLERK_LEEWAY_SECS must be a valid u64"))
+            .transpose()?
+            .unwrap_or(crate::auth::clerk::DEFAULT_LEEWAY_SECS);
 
         let clerk_webhook_secret = get("CLERK_WEBHOOK_SECRET").filter(|s| !s.is_empty());
         if let Some(ref s) = clerk_webhook_secret {

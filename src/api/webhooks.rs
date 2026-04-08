@@ -173,25 +173,48 @@ pub async fn clerk_webhook(
             let email = data
                 .primary_email()
                 .ok_or_else(|| AppError::Validation("clerk user has no email".into()))?;
-            user::upsert_from_clerk(
+            match user::upsert_from_clerk(
                 pool.get_ref(),
                 &data.id,
                 email,
                 data.display_name().as_deref(),
                 data.image_url.as_deref(),
             )
-            .await?;
+            .await
+            {
+                Ok(_) => {}
+                // Email collision with a DIFFERENT Clerk user. Returning
+                // 409 to Clerk would make it retry this webhook forever,
+                // permanently blocking the new user from onboarding. We
+                // can't auto-link — that requires explicit consent — so
+                // we log loudly, surface it to the operator, and return
+                // 200 so Clerk stops retrying. The new user will be
+                // unable to sign in until the operator resolves the
+                // collision manually.
+                Err(AppError::Conflict(msg)) => {
+                    tracing::error!(
+                        req_id = %req_id,
+                        clerk_user_id = %data.id,
+                        email = %email,
+                        "clerk_webhook: email collision on user upsert — {msg}"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
         "user.deleted" => {
             let data: ClerkDeletedData = serde_json::from_value(event.data).map_err(|e| {
                 AppError::Validation(format!("invalid clerk delete payload: {e}"))
             })?;
-            // Clerk sets `deleted: true` on hard-delete events; we
-            // honour it defensively (the event type alone is enough
-            // per the docs, but a mismatched flag is a red flag).
-            if matches!(data.deleted, Some(false)) {
+            // Clerk sets `deleted: true` on every hard-delete event.
+            // Require the explicit `Some(true)` marker rather than
+            // accepting absence: an event with no `deleted` field is
+            // either a forward-incompatible schema change from Clerk
+            // or a malformed delivery, and deleting a user based on
+            // "we couldn't tell" is the wrong failure mode.
+            if data.deleted != Some(true) {
                 return Err(AppError::Validation(
-                    "user.deleted event with deleted=false".into(),
+                    "user.deleted event missing explicit deleted=true marker".into(),
                 ));
             }
             user::hard_delete_by_clerk_id(pool.get_ref(), &data.id).await?;

@@ -88,6 +88,10 @@ async fn main() -> anyhow::Result<()> {
     let idem_data = web::Data::new(idempotency_cache);
     let clerk_config_data = web::Data::new(clerk_config);
     let jwks_data = web::Data::new(jwks_cache);
+    // Shared HTTP client for Stripe API calls. Built once so the
+    // billing handlers reuse its connection pool + TLS session cache
+    // across requests instead of rebuilding per call.
+    let stripe_http = web::Data::new(api::billing::build_stripe_client()?);
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -116,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(idem_data.clone())
             .app_data(clerk_config_data.clone())
             .app_data(jwks_data.clone())
+            .app_data(stripe_http.clone())
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             // Health + metrics (unauthenticated; protect via network policy)
             .route("/health", web::get().to(api::health::health))
