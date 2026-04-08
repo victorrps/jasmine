@@ -58,6 +58,11 @@ async fn auto_mode_routes_structured_doc_through_paddle_end_to_end() {
             max_concurrent_parses: 8,
             parse_deadline_secs: 90,
             extract_max_input_chars: 200_000,
+            clerk_jwks_url: None,
+            clerk_issuer: None,
+            clerk_leeway_secs: 30,
+            dev_auth_bypass: false,
+            clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);

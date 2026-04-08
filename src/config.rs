@@ -48,6 +48,35 @@ pub struct AppConfig {
     /// rather than silently truncated. Default 200_000 chars
     /// (~50 K tokens). Set lower to bound your Anthropic spend per call.
     pub extract_max_input_chars: usize,
+    /// Clerk JWKS endpoint URL, e.g.
+    /// `https://your-app.clerk.accounts.dev/.well-known/jwks.json`.
+    /// `None` disables Clerk verification entirely; combine with
+    /// `dev_auth_bypass` for local development without a Clerk instance.
+    pub clerk_jwks_url: Option<String>,
+    /// Clerk issuer (the frontend API URL). Required when `clerk_jwks_url`
+    /// is set; ignored otherwise.
+    pub clerk_issuer: Option<String>,
+    /// JWT clock-skew leeway in seconds for Clerk verification.
+    /// Default 30s.
+    pub clerk_leeway_secs: u64,
+    /// **DEV ONLY**: when `true` AND `clerk_jwks_url` is unset, the
+    /// `ClerkAuth` extractor accepts an `X-Dev-User-Id` header in lieu
+    /// of a real Clerk JWT, returning that string as the user ID.
+    /// This is the local-development escape hatch — it lets you hit
+    /// authenticated endpoints with `curl -H 'X-Dev-User-Id: user_test'`
+    /// without spinning up a Clerk dev instance.
+    ///
+    /// **Cannot be enabled in production**: the validation in
+    /// `from_vars` rejects the combination `dev_auth_bypass=true` AND
+    /// `clerk_jwks_url=Some(_)`. The bypass branch in `ClerkAuth` also
+    /// double-checks this at request time so a misconfigured deploy
+    /// fails closed instead of silently allowing header impersonation.
+    pub dev_auth_bypass: bool,
+    /// Clerk webhook signing secret (Svix format: `whsec_<base64>`).
+    /// When unset the `/webhooks/clerk` endpoint returns 501 — we
+    /// refuse to accept unverified webhooks. Find it in the Clerk
+    /// dashboard under **Webhooks → Signing Secret**.
+    pub clerk_webhook_secret: Option<String>,
 }
 
 /// Backend routing mode for PaddleOCR.
@@ -170,6 +199,54 @@ impl AppConfig {
             anyhow::bail!("EXTRACT_MAX_INPUT_CHARS must be greater than 0");
         }
 
+        let clerk_jwks_url = get("CLERK_JWKS_URL").filter(|s| !s.is_empty());
+        let clerk_issuer = get("CLERK_ISSUER").filter(|s| !s.is_empty());
+        if clerk_jwks_url.is_some() && clerk_issuer.is_none() {
+            anyhow::bail!("CLERK_ISSUER must be set when CLERK_JWKS_URL is configured");
+        }
+        if clerk_issuer.is_some() && clerk_jwks_url.is_none() {
+            // Warn rather than bail: refusing to start would break
+            // any deploy that has the issuer set as a "preparation"
+            // step before wiring the JWKS URL. The orphaned issuer
+            // is harmless at runtime (the verifier never reaches the
+            // `iss` check unless `jwks_url` is set), but the warning
+            // ensures the operator knows their configuration is
+            // incomplete.
+            tracing::warn!(
+                "CLERK_ISSUER is set but CLERK_JWKS_URL is not — \
+                 CLERK_ISSUER will be ignored until the JWKS URL is configured."
+            );
+        }
+        let clerk_leeway_secs: u64 = get("CLERK_LEEWAY_SECS")
+            .unwrap_or_else(|| "30".into())
+            .parse()
+            .context("CLERK_LEEWAY_SECS must be a valid u64")?;
+
+        let clerk_webhook_secret = get("CLERK_WEBHOOK_SECRET").filter(|s| !s.is_empty());
+        if let Some(ref s) = clerk_webhook_secret {
+            if !s.starts_with("whsec_") {
+                anyhow::bail!(
+                    "CLERK_WEBHOOK_SECRET must start with 'whsec_' (Svix format)"
+                );
+            }
+        }
+
+        let dev_auth_bypass = get("DEV_AUTH_BYPASS")
+            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        // Hard safety: dev bypass and real Clerk are mutually exclusive.
+        // Refusing this combination at startup means a deploy that
+        // accidentally leaves DEV_AUTH_BYPASS=true in its env cannot
+        // also be wired to real Clerk and silently grant header
+        // impersonation in production.
+        if dev_auth_bypass && clerk_jwks_url.is_some() {
+            anyhow::bail!(
+                "DEV_AUTH_BYPASS=true is mutually exclusive with CLERK_JWKS_URL — \
+                 unset one of them. The bypass exists only for local development \
+                 against a system not yet wired to a Clerk instance."
+            );
+        }
+
         Ok(Self {
             host: get("HOST").unwrap_or_else(|| "127.0.0.1".into()),
             port,
@@ -189,6 +266,11 @@ impl AppConfig {
             max_concurrent_parses,
             parse_deadline_secs,
             extract_max_input_chars,
+            clerk_jwks_url,
+            clerk_issuer,
+            clerk_leeway_secs,
+            dev_auth_bypass,
+            clerk_webhook_secret,
         })
     }
 }
@@ -583,6 +665,92 @@ mod tests {
             cfg.anthropic_api_key.as_deref(),
             Some("   "),
             "whitespace-only key is non-empty and must be preserved as Some"
+        );
+    }
+
+    // ── Clerk + dev-bypass parsing ─────────────────────────────────────────
+
+    #[test]
+    fn clerk_defaults_to_disabled() {
+        let cfg = AppConfig::from_vars(&base_vars()).unwrap();
+        assert_eq!(cfg.clerk_jwks_url, None);
+        assert_eq!(cfg.clerk_issuer, None);
+        assert_eq!(cfg.clerk_leeway_secs, 30);
+        assert!(!cfg.dev_auth_bypass);
+    }
+
+    #[test]
+    fn clerk_url_requires_issuer() {
+        let mut vars = base_vars();
+        vars.insert(
+            "CLERK_JWKS_URL".into(),
+            "https://test.clerk.accounts.dev/.well-known/jwks.json".into(),
+        );
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(err.contains("CLERK_ISSUER"), "got: {err}");
+    }
+
+    #[test]
+    fn clerk_url_with_issuer_succeeds() {
+        let mut vars = base_vars();
+        vars.insert(
+            "CLERK_JWKS_URL".into(),
+            "https://test.clerk.accounts.dev/.well-known/jwks.json".into(),
+        );
+        vars.insert("CLERK_ISSUER".into(), "https://test.clerk.accounts.dev".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert!(cfg.clerk_jwks_url.is_some());
+        assert_eq!(
+            cfg.clerk_issuer.as_deref(),
+            Some("https://test.clerk.accounts.dev")
+        );
+    }
+
+    #[test]
+    fn clerk_leeway_parses_custom_value() {
+        let mut vars = base_vars();
+        vars.insert("CLERK_LEEWAY_SECS".into(), "60".into());
+        let cfg = AppConfig::from_vars(&vars).unwrap();
+        assert_eq!(cfg.clerk_leeway_secs, 60);
+    }
+
+    #[test]
+    fn dev_auth_bypass_accepts_truthy_strings() {
+        for v in &["true", "TRUE", "True", "1", "yes", "YES"] {
+            let mut vars = base_vars();
+            vars.insert("DEV_AUTH_BYPASS".into(), (*v).into());
+            let cfg = AppConfig::from_vars(&vars).unwrap();
+            assert!(cfg.dev_auth_bypass, "value {v:?} should enable bypass");
+        }
+    }
+
+    #[test]
+    fn dev_auth_bypass_rejects_falsy_strings() {
+        for v in &["false", "0", "no", "off", ""] {
+            let mut vars = base_vars();
+            vars.insert("DEV_AUTH_BYPASS".into(), (*v).into());
+            let cfg = AppConfig::from_vars(&vars).unwrap();
+            assert!(!cfg.dev_auth_bypass, "value {v:?} must NOT enable bypass");
+        }
+    }
+
+    #[test]
+    fn dev_auth_bypass_rejected_when_combined_with_clerk_url() {
+        // Hard safety: a deploy that accidentally leaves
+        // DEV_AUTH_BYPASS=true in its env and ALSO wires Clerk must
+        // refuse to start. This is the production guardrail that
+        // makes header impersonation impossible by config.
+        let mut vars = base_vars();
+        vars.insert("DEV_AUTH_BYPASS".into(), "true".into());
+        vars.insert(
+            "CLERK_JWKS_URL".into(),
+            "https://prod.clerk.accounts.dev/.well-known/jwks.json".into(),
+        );
+        vars.insert("CLERK_ISSUER".into(), "https://prod.clerk.accounts.dev".into());
+        let err = AppConfig::from_vars(&vars).unwrap_err().to_string();
+        assert!(
+            err.contains("DEV_AUTH_BYPASS") && err.contains("mutually exclusive"),
+            "expected mutually-exclusive error, got: {err}"
         );
     }
 }

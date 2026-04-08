@@ -37,6 +37,48 @@ async fn main() -> anyhow::Result<()> {
     let metrics = services::metrics::Metrics::new();
     let idempotency_cache = services::idempotency::IdempotencyCache::with_defaults();
 
+    // Clerk config + JWKS cache. The cache is constructed
+    // unconditionally so handler `web::Data<JwksCache>` extraction
+    // never fails — but it only does network refresh when a JWKS URL
+    // is actually configured. Dev-bypass mode (no Clerk URL +
+    // `DEV_AUTH_BYPASS=true`) skips JWKS entirely.
+    let clerk_config = auth::clerk::ClerkConfig {
+        jwks_url: config.clerk_jwks_url.clone().unwrap_or_default(),
+        issuer: config.clerk_issuer.clone().unwrap_or_default(),
+        leeway_secs: config.clerk_leeway_secs,
+        dev_auth_bypass: config.dev_auth_bypass,
+    };
+    // Log the chosen Clerk auth mode once at startup. The cache
+    // itself is constructed unconditionally below so handlers can
+    // always extract `web::Data<JwksCache>` without an Option dance.
+    let jwks_url_for_cache = match (&config.clerk_jwks_url, config.dev_auth_bypass) {
+        (Some(url), _) => {
+            tracing::info!(
+                jwks_url = %url,
+                issuer = ?config.clerk_issuer,
+                "Clerk auth: enabled"
+            );
+            url.clone()
+        }
+        (None, true) => {
+            tracing::warn!(
+                "DEV_AUTH_BYPASS is ENABLED — `X-Dev-User-Id` header will be \
+                 trusted as the user ID on all Clerk-protected endpoints. \
+                 This MUST be off in production. Combine with CLERK_JWKS_URL \
+                 to disable the bypass."
+            );
+            String::new()
+        }
+        (None, false) => {
+            tracing::info!(
+                "Clerk auth: disabled (no CLERK_JWKS_URL set, no DEV_AUTH_BYPASS). \
+                 Endpoints that require ClerkAuth will return 401."
+            );
+            String::new()
+        }
+    };
+    let jwks_cache = auth::clerk::JwksCache::new(jwks_url_for_cache)?;
+
     let bind_addr = format!("{}:{}", config.host, config.port);
     let config_data = web::Data::new(config);
     let pool_data = web::Data::new(pool);
@@ -44,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
     let gate_data = web::Data::new(parse_gate);
     let metrics_data = web::Data::new(metrics);
     let idem_data = web::Data::new(idempotency_cache);
+    let clerk_config_data = web::Data::new(clerk_config);
+    let jwks_data = web::Data::new(jwks_cache);
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -70,6 +114,8 @@ async fn main() -> anyhow::Result<()> {
             .app_data(gate_data.clone())
             .app_data(metrics_data.clone())
             .app_data(idem_data.clone())
+            .app_data(clerk_config_data.clone())
+            .app_data(jwks_data.clone())
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             // Health + metrics (unauthenticated; protect via network policy)
             .route("/health", web::get().to(api::health::health))
@@ -111,6 +157,12 @@ async fn main() -> anyhow::Result<()> {
                 web::scope("/billing")
                     .route("/plans", web::get().to(api::billing::list_plans))
                     .route("/webhook", web::post().to(api::billing::stripe_webhook)),
+            )
+            // Clerk webhooks (Svix-signed; no auth middleware — the
+            // signature IS the auth)
+            .route(
+                "/webhooks/clerk",
+                web::post().to(api::webhooks::clerk_webhook),
             )
             // MCP server (Streamable HTTP — no auth for POC, add API key auth for prod)
             .route("/mcp", web::post().to(api::mcp::mcp_handler))

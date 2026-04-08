@@ -29,6 +29,16 @@ macro_rules! test_app_with_key {
             max_concurrent_parses: 8,
             parse_deadline_secs: 90,
             extract_max_input_chars: 200_000,
+            clerk_jwks_url: None,
+            clerk_issuer: None,
+            clerk_leeway_secs: 30,
+            // dev_auth_bypass is wired into AppConfig but currently has
+            // no effect on these tests: no handler exercised here uses
+            // ClerkAuth yet (piece-6 cutover). When that changes, this
+            // test harness must also register web::Data<ClerkConfig>
+            // and web::Data<JwksCache>, and flip this flag deliberately.
+            dev_auth_bypass: false,
+            clerk_webhook_secret: None,
         };
         let pool = db::init_db(&config.database_url).await.unwrap();
         let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
@@ -502,6 +512,14 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
         max_concurrent_parses: 8,
         parse_deadline_secs: 90,
         extract_max_input_chars: 32, // tiny ceiling
+        clerk_jwks_url: None,
+        clerk_issuer: None,
+        clerk_leeway_secs: 30,
+        // dev_auth_bypass is wired into AppConfig but currently has no
+        // effect on these tests; see piece-6 cutover note in the
+        // sister test_app_with_key! macro for the rationale.
+        dev_auth_bypass: false,
+            clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
@@ -672,7 +690,15 @@ async fn test_parse_returns_503_when_gate_saturated() {
         paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
         max_concurrent_parses: 1,
         parse_deadline_secs: 90,
-            extract_max_input_chars: 200_000,
+        extract_max_input_chars: 200_000,
+        clerk_jwks_url: None,
+        clerk_issuer: None,
+        clerk_leeway_secs: 30,
+        // dev_auth_bypass is wired into AppConfig but currently has no
+        // effect on these tests; see piece-6 cutover note in the
+        // sister test_app_with_key! macro for the rationale.
+        dev_auth_bypass: false,
+            clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
     let gate = docforge::services::parse_gate::ParseGate::new(1);
@@ -762,6 +788,303 @@ async fn test_parse_returns_503_when_gate_saturated() {
         .to_str()
         .unwrap();
     assert_eq!(retry, "5");
+}
+
+/// Build a synthetic PDF whose first 4 KB contains an `/Encrypt` trailer
+/// entry. The bytes do not need to be a fully parseable PDF — only the
+/// `is_encrypted_pdf` heuristic in `pdf_parser` reads them, and it only
+/// scans the first 4 KB after the header.
+fn synthetic_encrypted_pdf_bytes() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"%binary marker\n");
+    bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R /Encrypt 4 0 R >>\n");
+    bytes.resize(512, b' ');
+    bytes
+}
+
+#[actix_rt::test]
+async fn test_parse_returns_422_for_encrypted_pdf() {
+    let (app, api_key, _, _) = test_app_with_key!();
+    let (boundary, body) = build_multipart_pdf(&synthetic_encrypted_pdf_bytes());
+
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(body)
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        422,
+        "encrypted PDF must surface as 422 Unprocessable Entity"
+    );
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["error"]["code"].as_str(), Some("ENCRYPTED_PDF"));
+    assert_eq!(body["error"]["retryable"].as_bool(), Some(false));
+}
+
+#[actix_rt::test]
+async fn test_parse_returns_504_when_deadline_exceeded() {
+    // Custom test app with parse_deadline_secs=0 so the timeout fires
+    // immediately, before any backend work can complete. The handler
+    // must surface DeadlineExceeded as 504, with the metric increment
+    // recorded under the right status label.
+    let config = AppConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        database_url: format!(
+            "sqlite://file:test_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        ),
+        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
+        jwt_expiry_minutes: 15,
+        rate_limit_per_minute: 1000,
+        api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
+        anthropic_api_key: None,
+        stripe_secret_key: None,
+        stripe_webhook_secret: None,
+        tesseract_path: "tesseract".into(),
+        pdftoppm_path: "pdftoppm".into(),
+        paddleocr_url: None,
+        paddleocr_timeout_secs: 120,
+        paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
+        max_concurrent_parses: 8,
+        parse_deadline_secs: 0,
+        extract_max_input_chars: 200_000,
+        clerk_jwks_url: None,
+        clerk_issuer: None,
+        clerk_leeway_secs: 30,
+        // dev_auth_bypass is wired into AppConfig but currently has no
+        // effect on these tests; see piece-6 cutover note in the
+        // sister test_app_with_key! macro for the rationale.
+        dev_auth_bypass: false,
+            clerk_webhook_secret: None,
+    };
+    let pool = db::init_db(&config.database_url).await.unwrap();
+    let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
+
+    let app = test::init_service(
+        App::new()
+            .wrap(docforge::middleware::request_id::RequestIdMiddleware)
+            .wrap(actix_governor::Governor::new(&gov))
+            .app_data(web::Data::new(config))
+            .app_data(web::Data::new(pool))
+            .app_data(web::Data::new(Instant::now()))
+            .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
+            .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
+            .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
+            .route("/metrics", web::get().to(docforge::api::metrics::metrics))
+            .service(
+                web::scope("/auth")
+                    .route("/register", web::post().to(docforge::auth::handlers::register))
+                    .route("/login", web::post().to(docforge::auth::handlers::login)),
+            )
+            .service(
+                web::scope("/api-keys")
+                    .route("", web::post().to(docforge::auth::handlers::create_key)),
+            )
+            .service(
+                web::scope("/v1")
+                    .route("/parse", web::post().to(docforge::api::parse::parse_pdf)),
+            ),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri("/auth/register")
+        .set_json(serde_json::json!({"email":"deadline@test.com","password":"password123"}))
+        .to_request();
+    let _ = test::call_service(&app, req).await;
+    let req = test::TestRequest::post()
+        .uri("/auth/login")
+        .set_json(serde_json::json!({"email":"deadline@test.com","password":"password123"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let jwt = body["access_token"].as_str().unwrap().to_string();
+    let req = test::TestRequest::post()
+        .uri("/api-keys")
+        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .set_json(serde_json::json!({"name":"Test"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let api_key = body["key"].as_str().unwrap().to_string();
+
+    let (boundary, payload_body) = build_multipart_pdf(&common::sample_pdf_bytes());
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(payload_body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        504,
+        "zero-second deadline must surface as 504 Gateway Timeout"
+    );
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(body["error"]["code"].as_str(), Some("DEADLINE_EXCEEDED"));
+    assert_eq!(
+        body["error"]["retryable"].as_bool(),
+        Some(true),
+        "deadline exceedances must be flagged retryable"
+    );
+
+    // Verify the outcome was recorded in metrics with the 504 status.
+    let req = test::TestRequest::get().uri("/metrics").to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body = test::read_body(resp).await;
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("parse_requests_total{endpoint=\"/v1/parse\",status=\"504\"}"),
+        "504 outcome must be recorded in parse_requests counter; got: {text}"
+    );
+}
+
+#[actix_rt::test]
+async fn test_paddle_degraded_metric_increments_after_fallback() {
+    // Point Paddle at an unroutable address so the call fails. Run a
+    // scanned PDF that requires OCR so the dispatcher actually reaches
+    // the Paddle path, then falls back to Tesseract. Both the warning
+    // in the response body and the `paddle_degraded_total` metric must
+    // be visible to the caller.
+    let config = AppConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        database_url: format!(
+            "sqlite://file:test_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        ),
+        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
+        jwt_expiry_minutes: 15,
+        rate_limit_per_minute: 1000,
+        api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
+        anthropic_api_key: None,
+        stripe_secret_key: None,
+        stripe_webhook_secret: None,
+        tesseract_path: "tesseract".into(),
+        pdftoppm_path: "pdftoppm".into(),
+        paddleocr_url: Some("http://127.0.0.1:1".into()),
+        paddleocr_timeout_secs: 1,
+        paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
+        max_concurrent_parses: 8,
+        parse_deadline_secs: 90,
+        extract_max_input_chars: 200_000,
+        clerk_jwks_url: None,
+        clerk_issuer: None,
+        clerk_leeway_secs: 30,
+        // dev_auth_bypass is wired into AppConfig but currently has no
+        // effect on these tests; see piece-6 cutover note in the
+        // sister test_app_with_key! macro for the rationale.
+        dev_auth_bypass: false,
+            clerk_webhook_secret: None,
+    };
+    let pool = db::init_db(&config.database_url).await.unwrap();
+    let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
+
+    let app = test::init_service(
+        App::new()
+            .wrap(docforge::middleware::request_id::RequestIdMiddleware)
+            .wrap(actix_governor::Governor::new(&gov))
+            .app_data(web::Data::new(config))
+            .app_data(web::Data::new(pool))
+            .app_data(web::Data::new(Instant::now()))
+            .app_data(web::Data::new(docforge::services::parse_gate::ParseGate::new(8)))
+            .app_data(web::Data::new(docforge::services::metrics::Metrics::new()))
+            .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
+            .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
+            .route("/metrics", web::get().to(docforge::api::metrics::metrics))
+            .service(
+                web::scope("/auth")
+                    .route("/register", web::post().to(docforge::auth::handlers::register))
+                    .route("/login", web::post().to(docforge::auth::handlers::login)),
+            )
+            .service(
+                web::scope("/api-keys")
+                    .route("", web::post().to(docforge::auth::handlers::create_key)),
+            )
+            .service(
+                web::scope("/v1")
+                    .route("/parse", web::post().to(docforge::api::parse::parse_pdf)),
+            ),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri("/auth/register")
+        .set_json(serde_json::json!({"email":"degr@test.com","password":"password123"}))
+        .to_request();
+    let _ = test::call_service(&app, req).await;
+    let req = test::TestRequest::post()
+        .uri("/auth/login")
+        .set_json(serde_json::json!({"email":"degr@test.com","password":"password123"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let jwt = body["access_token"].as_str().unwrap().to_string();
+    let req = test::TestRequest::post()
+        .uri("/api-keys")
+        .insert_header(("Authorization", format!("Bearer {jwt}")))
+        .set_json(serde_json::json!({"name":"Test"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let api_key = body["key"].as_str().unwrap().to_string();
+
+    let scanned = include_bytes!("fixtures/scanned_form.pdf").to_vec();
+    let (boundary, payload_body) = build_multipart_pdf(&scanned);
+    let req = test::TestRequest::post()
+        .uri("/v1/parse")
+        .insert_header(("X-API-Key", api_key.as_str()))
+        .insert_header((
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+        .set_payload(payload_body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "tesseract fallback must recover the scanned doc"
+    );
+    let body: serde_json::Value = test::read_body_json(resp).await;
+    let warnings = body["document"]["metadata"]["warnings"]
+        .as_array()
+        .expect("warnings array must be present after Paddle degradation");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str() == Some("paddle_degraded_to_tesseract")),
+        "expected paddle_degraded_to_tesseract warning, got {warnings:?}"
+    );
+    assert_eq!(
+        body["document"]["metadata"]["routed_to"].as_str(),
+        Some("tesseract"),
+        "fallback must report tesseract as the actual backend"
+    );
+
+    // Now scrape /metrics: paddle_degraded_total must be ≥ 1.
+    let req = test::TestRequest::get().uri("/metrics").to_request();
+    let resp = test::call_service(&app, req).await;
+    let body = test::read_body(resp).await;
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("paddle_degraded_total 1"),
+        "paddle_degraded_total must increment to 1 after fallback; got: {text}"
+    );
 }
 
 #[actix_rt::test]

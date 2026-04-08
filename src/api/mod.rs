@@ -5,3 +5,4 @@ pub mod health;
 pub mod mcp;
 pub mod metrics;
 pub mod parse;
+pub mod webhooks;
