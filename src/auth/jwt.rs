@@ -15,6 +15,13 @@ pub struct Claims {
 }
 
 /// Create a signed JWT for the given user.
+///
+/// Used by integration tests to seed users for the JwtAuth-protected
+/// `/api-keys` handlers; the production `/auth/login` flow that
+/// historically called this was deleted in piece-4. Rust's dead-code
+/// analysis can't see integration-test usage from the bin target.
+// TODO(piece-6): delete jwt.rs once /api-keys handlers move to ClerkAuth.
+#[allow(dead_code)]
 pub fn create_token(user_id: &str, secret: &str, expiry_minutes: u64) -> Result<String, AppError> {
     let now = chrono::Utc::now().timestamp() as usize;
     let claims = Claims {

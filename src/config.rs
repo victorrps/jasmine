@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub port: u16,
     pub database_url: String,
     pub jwt_secret: String,
+    // TODO(piece-6): drop with jwt.rs once /api-keys handlers move to ClerkAuth.
+    #[allow(dead_code)]
     pub jwt_expiry_minutes: u64,
     pub rate_limit_per_minute: u64,
     /// Server-side HMAC key for API key hashing. Prevents offline brute-force if DB is leaked.

@@ -25,6 +25,8 @@ pub struct ErrorBody {
 /// Application error type. Maps to HTTP status codes and stable error codes.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    // TODO(piece-6): remove with the JwtAuth/jwt.rs cleanup.
+    #[allow(dead_code)]
     #[error("Invalid credentials")]
     InvalidCredentials,
 

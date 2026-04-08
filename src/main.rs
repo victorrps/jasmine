@@ -120,24 +120,15 @@ async fn main() -> anyhow::Result<()> {
             // Health + metrics (unauthenticated; protect via network policy)
             .route("/health", web::get().to(api::health::health))
             .route("/metrics", web::get().to(api::metrics::metrics))
-            // Auth (tighter rate limit: 5 req/min per IP)
-            .service(
-                web::scope("/auth")
-                    .wrap(Governor::new(&auth_governor_cfg))
-                    .route("/register", web::post().to(auth::handlers::register))
-                    .route("/login", web::post().to(auth::handlers::login))
-                    .route(
-                        "/oauth/{provider}",
-                        web::get().to(auth::handlers::oauth_redirect),
-                    )
-                    .route(
-                        "/oauth/{provider}/callback",
-                        web::get().to(auth::handlers::oauth_callback),
-                    ),
-            )
-            // API key management (JWT protected)
+            // API key management — TODO(piece-6): swap JwtAuth for ClerkAuth.
+            // The /auth/{register,login,oauth/*} endpoints were removed in
+            // piece-4: identity is now owned by Clerk and provisioned via
+            // POST /webhooks/clerk. The auth_governor_cfg lives on for the
+            // tighter rate-limit bucket once the user-facing endpoints
+            // (e.g. /me, /billing/checkout-session) are wired in.
             .service(
                 web::scope("/api-keys")
+                    .wrap(Governor::new(&auth_governor_cfg))
                     .route("", web::post().to(auth::handlers::create_key))
                     .route("", web::get().to(auth::handlers::list_keys))
                     .route("/{key_id}", web::delete().to(auth::handlers::revoke_key)),

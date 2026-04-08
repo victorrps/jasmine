@@ -5,44 +5,76 @@ use docforge::config::AppConfig;
 use docforge::db;
 use std::time::Instant;
 
+/// Seed a Clerk-mirrored user and mint a JWT for the local users.id.
+/// Returns just the JWT string — callers that already have a pool
+/// and a config drop in this two-liner instead of the old HTTP
+/// register/login dance.
+async fn seed_jwt(pool: &sqlx::SqlitePool, jwt_secret: &str, email: &str) -> String {
+    let clerk_id = format!("user_{}", uuid::Uuid::new_v4().simple());
+    let user = docforge::models::user::upsert_from_clerk(pool, &clerk_id, email, Some("Test"), None)
+        .await
+        .unwrap();
+    docforge::auth::jwt::create_token(&user.id, jwt_secret, 15).unwrap()
+}
+
+/// Build a fresh AppConfig for an isolated in-memory test DB.
+fn test_config() -> AppConfig {
+    AppConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        database_url: format!(
+            "sqlite://file:test_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        ),
+        jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
+        jwt_expiry_minutes: 15,
+        rate_limit_per_minute: 1000,
+        api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
+        anthropic_api_key: None,
+        stripe_secret_key: None,
+        stripe_webhook_secret: None,
+        tesseract_path: "tesseract".into(),
+        pdftoppm_path: "pdftoppm".into(),
+        paddleocr_url: None,
+        paddleocr_timeout_secs: 120,
+        paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
+        max_concurrent_parses: 8,
+        parse_deadline_secs: 90,
+        extract_max_input_chars: 200_000,
+        clerk_jwks_url: None,
+        clerk_issuer: None,
+        clerk_leeway_secs: 30,
+        // Piece-6 cutover (api_keys → ClerkAuth) will flip this on and
+        // register web::Data<ClerkConfig>/JwksCache. Until then, the
+        // api_keys handlers still consume JwtAuth, so tests seed a
+        // user via upsert_from_clerk and mint a JWT directly with
+        // docforge::auth::jwt::create_token.
+        dev_auth_bypass: false,
+        clerk_webhook_secret: None,
+    }
+}
+
+/// Seed a Clerk-mirrored user, mint a JWT for the local users.id PK,
+/// and create one API key. Returns `(app, api_key, jwt, key_id)`.
 macro_rules! test_app_with_key {
     () => {{
-        let config = AppConfig {
-            host: "127.0.0.1".into(),
-            port: 0,
-            database_url: format!(
-                "sqlite://file:test_{}?mode=memory&cache=shared",
-                uuid::Uuid::new_v4()
-            ),
-            jwt_secret: "test_secret_at_least_32_chars_long_for_validation".into(),
-            jwt_expiry_minutes: 15,
-            rate_limit_per_minute: 1000,
-            api_key_pepper: "test_pepper_for_integration_tests_only!".into(),
-            anthropic_api_key: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            tesseract_path: "tesseract".into(),
-            pdftoppm_path: "pdftoppm".into(),
-            paddleocr_url: None,
-            paddleocr_timeout_secs: 120,
-            paddleocr_mode: docforge::config::PaddleOcrMode::Fallback,
-            max_concurrent_parses: 8,
-            parse_deadline_secs: 90,
-            extract_max_input_chars: 200_000,
-            clerk_jwks_url: None,
-            clerk_issuer: None,
-            clerk_leeway_secs: 30,
-            // dev_auth_bypass is wired into AppConfig but currently has
-            // no effect on these tests: no handler exercised here uses
-            // ClerkAuth yet (piece-6 cutover). When that changes, this
-            // test harness must also register web::Data<ClerkConfig>
-            // and web::Data<JwksCache>, and flip this flag deliberately.
-            dev_auth_bypass: false,
-            clerk_webhook_secret: None,
-        };
+        let config = test_config();
         let pool = db::init_db(&config.database_url).await.unwrap();
+
+        // Seed a user via the Clerk upsert path.
+        let clerk_id = format!("user_{}", uuid::Uuid::new_v4().simple());
+        let user = docforge::models::user::upsert_from_clerk(
+            &pool,
+            &clerk_id,
+            "p@test.com",
+            Some("Test"),
+            None,
+        )
+        .await
+        .unwrap();
+        let jwt = docforge::auth::jwt::create_token(&user.id, &config.jwt_secret, 15).unwrap();
+
         let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
-        let auth_gov = docforge::middleware::rate_limit::build_auth_governor();
         let app = test::init_service(
             App::new()
                 .wrap(docforge::middleware::request_id::RequestIdMiddleware)
@@ -58,12 +90,6 @@ macro_rules! test_app_with_key {
                 .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
                 .route("/health", web::get().to(docforge::api::health::health))
                 .route("/metrics", web::get().to(docforge::api::metrics::metrics))
-                .service(
-                    web::scope("/auth")
-                        .wrap(actix_governor::Governor::new(&auth_gov))
-                        .route("/register", web::post().to(docforge::auth::handlers::register))
-                        .route("/login", web::post().to(docforge::auth::handlers::login)),
-                )
                 .service(
                     web::scope("/api-keys")
                         .route("", web::post().to(docforge::auth::handlers::create_key))
@@ -83,22 +109,7 @@ macro_rules! test_app_with_key {
         )
         .await;
 
-        // Register + login
-        let req = test::TestRequest::post()
-            .uri("/auth/register")
-            .set_json(serde_json::json!({"email":"p@test.com","password":"password123"}))
-            .to_request();
-        test::call_service(&app, req).await;
-
-        let req = test::TestRequest::post()
-            .uri("/auth/login")
-            .set_json(serde_json::json!({"email":"p@test.com","password":"password123"}))
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        let body: serde_json::Value = test::read_body_json(resp).await;
-        let jwt = body["access_token"].as_str().unwrap().to_string();
-
-        // Create API key
+        // Create API key via the (still JwtAuth-protected) endpoint.
         let req = test::TestRequest::post()
             .uri("/api-keys")
             .insert_header(("Authorization", format!("Bearer {jwt}")))
@@ -522,6 +533,7 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
+    let jwt = seed_jwt(&pool, &config.jwt_secret, "big@e.com").await;
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -538,11 +550,6 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
                 .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
-                web::scope("/auth")
-                    .route("/register", web::post().to(docforge::auth::handlers::register))
-                    .route("/login", web::post().to(docforge::auth::handlers::login)),
-            )
-            .service(
                 web::scope("/api-keys")
                     .route("", web::post().to(docforge::auth::handlers::create_key)),
             )
@@ -552,20 +559,6 @@ async fn test_extract_returns_413_when_input_exceeds_ceiling() {
             ),
     )
     .await;
-
-    let req = test::TestRequest::post()
-        .uri("/auth/register")
-        .set_json(serde_json::json!({"email":"big@e.com","password":"test_password_long"}))
-        .to_request();
-    let _ = test::call_service(&app, req).await;
-
-    let req = test::TestRequest::post()
-        .uri("/auth/login")
-        .set_json(serde_json::json!({"email":"big@e.com","password":"test_password_long"}))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    let jwt = body["access_token"].as_str().unwrap().to_string();
 
     let req = test::TestRequest::post()
         .uri("/api-keys")
@@ -701,6 +694,7 @@ async fn test_parse_returns_503_when_gate_saturated() {
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
+    let jwt = seed_jwt(&pool, &config.jwt_secret, "gate@example.com").await;
     let gate = docforge::services::parse_gate::ParseGate::new(1);
     let gate_for_holding = gate.clone();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
@@ -717,11 +711,6 @@ async fn test_parse_returns_503_when_gate_saturated() {
                 .app_data(web::Data::new(docforge::services::idempotency::IdempotencyCache::with_defaults()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
-                web::scope("/auth")
-                    .route("/register", web::post().to(docforge::auth::handlers::register))
-                    .route("/login", web::post().to(docforge::auth::handlers::login)),
-            )
-            .service(
                 web::scope("/api-keys")
                     .route("", web::post().to(docforge::auth::handlers::create_key)),
             )
@@ -731,29 +720,6 @@ async fn test_parse_returns_503_when_gate_saturated() {
             ),
     )
     .await;
-
-    // Register + login + create API key inline (can't reuse the macro
-    // because we need a custom gate). Stripped down: just enough to
-    // authenticate against the saturated handler.
-    let req = test::TestRequest::post()
-        .uri("/auth/register")
-        .set_json(serde_json::json!({
-            "email": "gate@example.com",
-            "password": "test_password_long"
-        }))
-        .to_request();
-    let _ = test::call_service(&app, req).await;
-
-    let req = test::TestRequest::post()
-        .uri("/auth/login")
-        .set_json(serde_json::json!({
-            "email": "gate@example.com",
-            "password": "test_password_long"
-        }))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    let jwt = body["access_token"].as_str().unwrap().to_string();
 
     let req = test::TestRequest::post()
         .uri("/api-keys")
@@ -866,6 +832,7 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
+    let jwt = seed_jwt(&pool, &config.jwt_secret, "deadline@test.com").await;
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -881,11 +848,6 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .route("/metrics", web::get().to(docforge::api::metrics::metrics))
             .service(
-                web::scope("/auth")
-                    .route("/register", web::post().to(docforge::auth::handlers::register))
-                    .route("/login", web::post().to(docforge::auth::handlers::login)),
-            )
-            .service(
                 web::scope("/api-keys")
                     .route("", web::post().to(docforge::auth::handlers::create_key)),
             )
@@ -895,19 +857,6 @@ async fn test_parse_returns_504_when_deadline_exceeded() {
             ),
     )
     .await;
-
-    let req = test::TestRequest::post()
-        .uri("/auth/register")
-        .set_json(serde_json::json!({"email":"deadline@test.com","password":"password123"}))
-        .to_request();
-    let _ = test::call_service(&app, req).await;
-    let req = test::TestRequest::post()
-        .uri("/auth/login")
-        .set_json(serde_json::json!({"email":"deadline@test.com","password":"password123"}))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    let jwt = body["access_token"].as_str().unwrap().to_string();
     let req = test::TestRequest::post()
         .uri("/api-keys")
         .insert_header(("Authorization", format!("Bearer {jwt}")))
@@ -992,6 +941,7 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
+    let jwt = seed_jwt(&pool, &config.jwt_secret, "degr@test.com").await;
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
 
     let app = test::init_service(
@@ -1007,11 +957,6 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .route("/metrics", web::get().to(docforge::api::metrics::metrics))
             .service(
-                web::scope("/auth")
-                    .route("/register", web::post().to(docforge::auth::handlers::register))
-                    .route("/login", web::post().to(docforge::auth::handlers::login)),
-            )
-            .service(
                 web::scope("/api-keys")
                     .route("", web::post().to(docforge::auth::handlers::create_key)),
             )
@@ -1021,19 +966,6 @@ async fn test_paddle_degraded_metric_increments_after_fallback() {
             ),
     )
     .await;
-
-    let req = test::TestRequest::post()
-        .uri("/auth/register")
-        .set_json(serde_json::json!({"email":"degr@test.com","password":"password123"}))
-        .to_request();
-    let _ = test::call_service(&app, req).await;
-    let req = test::TestRequest::post()
-        .uri("/auth/login")
-        .set_json(serde_json::json!({"email":"degr@test.com","password":"password123"}))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    let jwt = body["access_token"].as_str().unwrap().to_string();
     let req = test::TestRequest::post()
         .uri("/api-keys")
         .insert_header(("Authorization", format!("Bearer {jwt}")))

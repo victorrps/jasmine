@@ -65,8 +65,14 @@ async fn auto_mode_routes_structured_doc_through_paddle_end_to_end() {
             clerk_webhook_secret: None,
     };
     let pool = db::init_db(&config.database_url).await.unwrap();
+    // Seed user via the Clerk upsert path; mint a JWT for the local
+    // users.id PK since /api-keys still uses JwtAuth (piece-6 cutover).
+    let clerk_id = format!("user_{}", uuid::Uuid::new_v4().simple());
+    let user = docforge::models::user::upsert_from_clerk(
+        &pool, &clerk_id, "auto@test.com", Some("Test"), None,
+    ).await.unwrap();
+    let jwt = docforge::auth::jwt::create_token(&user.id, &config.jwt_secret, 15).unwrap();
     let gov = docforge::middleware::rate_limit::build_governor(config.rate_limit_per_minute);
-    let auth_gov = docforge::middleware::rate_limit::build_auth_governor();
 
     let app = test::init_service(
         App::new()
@@ -80,15 +86,6 @@ async fn auto_mode_routes_structured_doc_through_paddle_end_to_end() {
             .app_data(web::Data::new(Instant::now()))
             .app_data(web::PayloadConfig::default().limit(50 * 1024 * 1024))
             .service(
-                web::scope("/auth")
-                    .wrap(actix_governor::Governor::new(&auth_gov))
-                    .route(
-                        "/register",
-                        web::post().to(docforge::auth::handlers::register),
-                    )
-                    .route("/login", web::post().to(docforge::auth::handlers::login)),
-            )
-            .service(
                 web::scope("/api-keys")
                     .route("", web::post().to(docforge::auth::handlers::create_key)),
             )
@@ -98,21 +95,6 @@ async fn auto_mode_routes_structured_doc_through_paddle_end_to_end() {
             ),
     )
     .await;
-
-    // Register + login + API key
-    let req = test::TestRequest::post()
-        .uri("/auth/register")
-        .set_json(serde_json::json!({"email":"auto@test.com","password":"password123"}))
-        .to_request();
-    test::call_service(&app, req).await;
-
-    let req = test::TestRequest::post()
-        .uri("/auth/login")
-        .set_json(serde_json::json!({"email":"auto@test.com","password":"password123"}))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    let body: serde_json::Value = test::read_body_json(resp).await;
-    let jwt = body["access_token"].as_str().unwrap().to_string();
 
     let req = test::TestRequest::post()
         .uri("/api-keys")
